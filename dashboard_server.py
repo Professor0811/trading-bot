@@ -14,6 +14,7 @@ bot_instance = MultiTokenBot()
 
 
 def init_db():
+    """Ensure database tables exist on startup."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -38,18 +39,18 @@ init_db()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: launch bot loop inside background task
+    # Startup: Start trading bot in the background
     bot_task = asyncio.create_task(bot_instance.run_parallel_trading())
     yield
-    # Shutdown: stop bot cleanly
+    # Shutdown: Stop bot loop cleanly
     bot_instance.is_running = False
     bot_task.cancel()
 
 
 app = FastAPI(
     title="Autonomous Crypto Trading Bot Dashboard",
-    description="Real-time performance, trade logs, and metrics.",
-    version="1.0.0",
+    description="Real-time portfolio metrics, trade journal, and live DexScreener monitor.",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -79,22 +80,35 @@ async def get_metrics() -> Dict[str, Any]:
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Aggregate closed trade counts and wins
         cursor.execute("SELECT COUNT(*) as total_trades, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins FROM trades WHERE status='CLOSED'")
         row = cursor.fetchone()
         total_trades = row["total_trades"] if row and row["total_trades"] else 0
         wins = row["wins"] if row and row["wins"] else 0
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
 
+        # Calculate realized PnL
         cursor.execute("SELECT SUM(pnl) as total_pnl FROM trades WHERE status='CLOSED'")
         pnl_row = cursor.fetchone()
         total_pnl = round(pnl_row["total_pnl"], 2) if pnl_row and pnl_row["total_pnl"] is not None else 0.0
+        
+        # Calculate active trades count
+        cursor.execute("SELECT COUNT(*) as open_trades FROM trades WHERE status='OPEN'")
+        open_row = cursor.fetchone()
+        open_trades = open_row["open_trades"] if open_row else 0
+        
         conn.close()
 
+        # Engine cash or derived balance
+        balance = getattr(bot_instance.engine, "cash_balance", 1000.0)
+
         return {
-            "virtual_balance": round(1000.0 + total_pnl, 2),
+            "virtual_balance": round(balance, 2),
             "total_pnl": total_pnl,
-            "win_rate": round(win_rate, 2),
+            "win_rate": round(win_rate, 1),
             "total_trades": total_trades,
+            "open_trades": open_trades,
             "bot_status": "ACTIVE" if bot_instance.is_running else "STOPPED"
         }
     except Exception as e:
@@ -103,6 +117,7 @@ async def get_metrics() -> Dict[str, Any]:
             "total_pnl": 0.0,
             "win_rate": 0.0,
             "total_trades": 0,
+            "open_trades": 0,
             "bot_status": "STARTING",
             "info": str(e)
         }
@@ -113,7 +128,7 @@ async def get_trades() -> List[Dict[str, Any]]:
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 20")
+        cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 30")
         rows = cursor.fetchall()
         trades = [dict(ix) for ix in rows]
         conn.close()
@@ -134,29 +149,32 @@ async def serve_dashboard():
         <title>Autonomous Crypto Bot Dashboard</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
-            .container { max-width: 1100px; margin: auto; }
-            .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 16px; margin-bottom: 24px; }
-            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
-            .card { background: #1e293b; padding: 20px; border-radius: 10px; border: 1px solid #334155; }
-            .card h3 { margin: 0 0 10px 0; color: #94a3b8; font-size: 0.9rem; text-transform: uppercase; }
-            .card .value { font-size: 1.8rem; font-weight: bold; }
-            .chart-box { background: #1e293b; padding: 20px; border-radius: 10px; border: 1px solid #334155; margin-bottom: 24px; }
-            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; border: 1px solid #334155; }
-            th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #334155; font-size: 0.9rem; }
-            th { background: #0f172a; color: #94a3b8; }
-            .profit { color: #22c55e; }
-            .loss { color: #ef4444; }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b1120; color: #f8fafc; margin: 0; padding: 24px; }
+            .container { max-width: 1150px; margin: auto; }
+            .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 24px; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+            .card { background: #131d31; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2); }
+            .card h3 { margin: 0 0 8px 0; color: #94a3b8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+            .card .value { font-size: 1.75rem; font-weight: 700; }
+            .chart-box { background: #131d31; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; margin-bottom: 24px; }
+            table { width: 100%; border-collapse: collapse; background: #131d31; border-radius: 12px; overflow: hidden; border: 1px solid #1e293b; }
+            th, td { padding: 14px 18px; text-align: left; border-bottom: 1px solid #1e293b; font-size: 0.88rem; }
+            th { background: #0d1527; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 0.78rem; letter-spacing: 0.05em; }
+            .profit { color: #22c55e; font-weight: 600; }
+            .loss { color: #ef4444; font-weight: 600; }
+            .status-badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; }
+            .badge-open { background: #0284c725; color: #38bdf8; border: 1px solid #0284c750; }
+            .badge-closed { background: #33415550; color: #cbd5e1; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
                 <div>
-                    <h1 style="margin: 0; font-size: 1.5rem;">Autonomous Trading Bot Monitor</h1>
-                    <small style="color: #64748b;">Cloud VPS Deployment (Render)</small>
+                    <h1 style="margin: 0; font-size: 1.6rem; font-weight: 700;">Autonomous Trading Bot Monitor</h1>
+                    <small style="color: #64748b;">Cloud Deployment • Real DEX Pairs (SOL, BONK, JUP)</small>
                 </div>
-                <div id="status" style="background: #22c55e20; color: #22c55e; padding: 6px 12px; border-radius: 20px; font-weight: bold; font-size: 0.85rem;">ONLINE</div>
+                <div id="status" style="background: #22c55e20; color: #22c55e; border: 1px solid #22c55e50; padding: 6px 14px; border-radius: 9999px; font-weight: 600; font-size: 0.8rem;">ONLINE</div>
             </div>
 
             <div class="grid">
@@ -173,31 +191,31 @@ async def serve_dashboard():
                     <div class="value" id="winrate">0.0%</div>
                 </div>
                 <div class="card">
-                    <h3>Total Trades</h3>
+                    <h3>Closed Trades</h3>
                     <div class="value" id="trades">0</div>
                 </div>
             </div>
 
             <div class="chart-box">
-                <h3 style="margin-top: 0; color: #94a3b8;">Portfolio Trajectory</h3>
-                <canvas id="portfolioChart" height="90"></canvas>
+                <h3 style="margin-top: 0; color: #94a3b8; font-size: 0.9rem; text-transform: uppercase;">Portfolio Trajectory</h3>
+                <canvas id="portfolioChart" height="80"></canvas>
             </div>
 
-            <h3 style="color: #94a3b8;">Recent Trade Activity</h3>
+            <h3 style="color: #94a3b8; font-size: 0.9rem; text-transform: uppercase; margin-bottom: 12px;">Recent Trade Activity</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Time</th>
                         <th>Token</th>
                         <th>Action</th>
-                        <th>Entry</th>
-                        <th>Exit</th>
+                        <th>Entry Price</th>
+                        <th>Exit Price</th>
                         <th>PnL</th>
                         <th>Status</th>
                     </tr>
                 </thead>
                 <tbody id="trade-log">
-                    <tr><td colspan="7" style="text-align:center; color: #64748b;">Waiting for trade signals...</td></tr>
+                    <tr><td colspan="7" style="text-align:center; color: #64748b;">Awaiting trade updates...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -212,18 +230,26 @@ async def serve_dashboard():
                         label: 'Portfolio Value ($)',
                         data: [1000, 1000],
                         borderColor: '#38bdf8',
-                        tension: 0.3,
-                        fill: false
+                        backgroundColor: 'rgba(56, 189, 248, 0.08)',
+                        borderWidth: 2,
+                        tension: 0.25,
+                        fill: true
                     }]
                 },
                 options: {
                     responsive: true,
                     scales: {
-                        y: { grid: { color: '#334155' } },
-                        x: { grid: { color: '#334155' } }
+                        y: { grid: { color: '#1e293b' } },
+                        x: { grid: { color: '#1e293b' } }
                     }
                 }
             });
+
+            function formatPrice(val) {
+                if (!val || isNaN(val)) return '-';
+                const num = Number(val);
+                return num < 0.01 ? '$' + num.toFixed(6) : '$' + num.toFixed(4);
+            }
 
             async function updateDashboard() {
                 try {
@@ -242,20 +268,25 @@ async def serve_dashboard():
                     const tbody = document.getElementById('trade-log');
                     
                     if (trades && trades.length > 0) {
-                        tbody.innerHTML = trades.map(t => `
-                            <tr>
-                                <td>${t.timestamp || '-'}</td>
-                                <td><strong>${t.token_symbol}</strong></td>
-                                <td>${t.action}</td>
-                                <td>$${t.entry_price ? Number(t.entry_price).toFixed(4) : '0.00'}</td>
-                                <td>$${t.exit_price ? Number(t.exit_price).toFixed(4) : '-'}</td>
-                                <td class="${(t.pnl || 0) >= 0 ? 'profit' : 'loss'}">${(t.pnl || 0) >= 0 ? '+' : ''}${(t.pnl || 0).toFixed(2)}</td>
-                                <td>${t.status}</td>
-                            </tr>
-                        `).join('');
+                        tbody.innerHTML = trades.map(t => {
+                            const pnlVal = t.pnl || 0;
+                            const isWin = pnlVal >= 0;
+                            const statusClass = t.status === 'OPEN' ? 'badge-open' : 'badge-closed';
+                            return `
+                                <tr>
+                                    <td>${t.timestamp || '-'}</td>
+                                    <td><strong>${t.token_symbol}</strong></td>
+                                    <td>${t.action}</td>
+                                    <td>${formatPrice(t.entry_price)}</td>
+                                    <td>${formatPrice(t.exit_price)}</td>
+                                    <td class="${isWin ? 'profit' : 'loss'}">${t.status === 'CLOSED' ? (isWin ? '+' : '') + Number(pnlVal).toFixed(2) : '$0.00'}</td>
+                                    <td><span class="status-badge ${statusClass}">${t.status}</span></td>
+                                </tr>
+                            `;
+                        }).join('');
                     }
                 } catch(e) {
-                    console.error("Dashboard fetch error:", e);
+                    console.error("Dashboard refresh error:", e);
                 }
             }
 
