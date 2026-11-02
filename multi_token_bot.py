@@ -14,6 +14,7 @@ WATCH_LIST = ["SOL/USDC", "BONK/USDC", "JUP/USDC"]
 
 
 def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, pnl=0.0, status="OPEN"):
+    """Persist trade execution and exit records to SQLite."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -29,7 +30,8 @@ def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, 
 
 class MultiTokenBot:
     def __init__(self):
-        self.engine = PaperTradingEngine(initial_capital=STARTING_CAPITAL)
+        # Uses starting capital from config
+        self.engine = PaperTradingEngine()
         self.is_running = True
 
     async def monitor_token(self, symbol: str):
@@ -37,41 +39,43 @@ class MultiTokenBot:
 
         while self.is_running:
             try:
-                # 1. Market Simulation Feed
-                current_price = 150.0 + random.uniform(-6.0, 6.0)
+                # 1. Market Simulation Price Tick
+                current_price = round(150.0 + random.uniform(-6.0, 6.0), 4)
                 rsi = random.randint(35, 75)
                 momentum = random.uniform(0.5, 2.0)
                 liquidity = 55000.0
 
-                # 2. Check Exits if position is already open
+                # 2. Check Exits if position is active for this symbol
                 if self.engine.active_position and self.engine.active_position.get("symbol") == symbol:
                     closed = self.engine.check_exit_conditions(current_price)
                     if closed:
-                        entry = self.engine.active_position.get("entry_price", current_price)
+                        # Record closed trade into DB
                         record_trade_db(
                             token_symbol=symbol,
                             action="SELL",
                             amount=50.0,
-                            entry_price=entry,
-                            exit_price=closed["exit_price"],
-                            pnl=closed["pnl"],
+                            entry_price=closed.get("entry_price", current_price),
+                            exit_price=closed.get("exit_price", current_price),
+                            pnl=closed.get("pnl", 0.0),
                             status="CLOSED"
                         )
+                        # Send Instant Close Alert to Telegram
                         alert_msg = (
                             f"🏁 *Position Closed!*\n"
                             f"• Pair: `{symbol}`\n"
-                            f"• Reason: `{closed['reason']}`\n"
-                            f"• Exit Price: `${closed['exit_price']:.2f}`\n"
-                            f"• Trade PnL: `${closed['pnl']:+.2f}`\n"
-                            f"• Balance: `${self.engine.cash_balance:.2f}`"
+                            f"• Reason: `{closed.get('reason', 'Exit Target')}`\n"
+                            f"• Exit Price: `${closed.get('exit_price', current_price):.4f}`\n"
+                            f"• Trade PnL: `${closed.get('pnl', 0.0):+.2f}`\n"
+                            f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
                         )
                         send_telegram_alert(alert_msg)
 
                 # 3. If flat, check entry criteria
                 elif not self.engine.active_position:
-                    # Flexible strategy call
                     try:
-                        signal = strategy_agent.evaluate_market(trend="UP", rsi=rsi, momentum=momentum, liquidity_usd=liquidity)
+                        signal = strategy_agent.evaluate_market(
+                            trend="UP", rsi=rsi, momentum=momentum, liquidity_usd=liquidity
+                        )
                     except TypeError:
                         signal = strategy_agent.evaluate_market(
                             trend="UP", rsi=rsi, momentum=momentum,
@@ -81,26 +85,38 @@ class MultiTokenBot:
                         )
 
                     if signal == "BUY":
-                        order = self.engine.execute_order(symbol, "BUY", 50.0, current_price)
-                        if order:
+                        trade_amount = 50.0
+                        # Execute paper order (compatible with boolean or dict return)
+                        order_success = self.engine.execute_order(symbol, "BUY", trade_amount, current_price)
+                        
+                        if order_success:
+                            pos = self.engine.active_position or {}
+                            entry_p = pos.get("entry_price") or pos.get("exec_price") or current_price
+                            tp_p = pos.get("tp_price", entry_p * 1.05)
+                            sl_p = pos.get("sl_price", entry_p * 0.97)
+
+                            # Record open BUY trade into SQLite DB
                             record_trade_db(
                                 token_symbol=symbol,
                                 action="BUY",
-                                amount=50.0,
-                                entry_price=order["exec_price"],
+                                amount=trade_amount,
+                                entry_price=entry_p,
                                 status="OPEN"
                             )
+
+                            # Send Instant BUY Alert to Telegram
                             alert_msg = (
                                 f"🔔 *Trade Executed (BUY)*\n"
                                 f"• Pair: `{symbol}`\n"
-                                f"• Price: `${order['exec_price']:.2f}`\n"
-                                f"• Take-Profit: `${order.get('tp_price', current_price * 1.05):.2f}`\n"
-                                f"• Stop-Loss: `${order.get('sl_price', current_price * 0.975):.2f}`"
+                                f"• Entry Price: `${entry_p:.4f}`\n"
+                                f"• Take-Profit (TP): `${tp_p:.4f}`\n"
+                                f"• Stop-Loss (SL): `${sl_p:.4f}`\n"
+                                f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
                             )
                             send_telegram_alert(alert_msg)
 
             except Exception as err:
-                print(f"[{symbol} Runtime Error]: {err}")
+                print(f"[{symbol} Loop Error]: {err}")
 
             await asyncio.sleep(4)
 
