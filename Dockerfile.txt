@@ -1,0 +1,17 @@
+# Use official lightweight Python image
+FROM python:3.10-slim
+
+# Set working directory inside container
+WORKDIR /app
+
+# Copy requirements or install dependencies directly
+RUN pip install --no-cache-dir fastapi uvicorn requests scikit-learn solana solders numpy
+
+# Copy all project files into the container
+COPY . /app/
+
+# Expose port for FastAPI dashboard
+EXPOSE 8000
+
+# Command to run the multi-token trading bot by default
+CMD ["python", "multi_token_bot.py"]

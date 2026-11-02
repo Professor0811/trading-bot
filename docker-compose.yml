@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: autonomous_crypto_bot
+    restart: always
+    volumes:
+      - .:/app
+    command: python multi_token_bot.py
+
+  dashboard:
+    build: .
+    container_name: trading_dashboard
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: python dashboard_server.py
