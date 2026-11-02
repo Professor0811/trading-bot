@@ -29,13 +29,11 @@ def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, 
 
 class MultiTokenBot:
     def __init__(self):
-        # Initialize with $1000 capital if supported, otherwise engine default
         try:
             self.engine = PaperTradingEngine(initial_capital=1000.0)
         except TypeError:
             self.engine = PaperTradingEngine()
         
-        # Ensure sufficient balance
         if getattr(self.engine, "cash_balance", 0) < 100:
             self.engine.cash_balance = 1000.0
             
@@ -54,27 +52,33 @@ class MultiTokenBot:
 
                 # 2. Check Exits if position is active for this symbol
                 if self.engine.active_position and self.engine.active_position.get("symbol") == symbol:
+                    # Save position values BEFORE checking exit conditions
+                    entry_price = self.engine.active_position.get("entry_price", current_price)
+                    trade_amt = self.engine.active_position.get("amount") or self.engine.active_position.get("amount_usd", 20.0)
+
                     closed = self.engine.check_exit_conditions(current_price)
                     if closed:
-                        amt = self.engine.active_position.get("amount") or self.engine.active_position.get("amount_usd", 20.0)
-                        entry = self.engine.active_position.get("entry_price", current_price)
+                        exit_price = closed.get("exit_price", current_price)
                         pnl = closed.get("pnl", 0.0)
+                        reason = closed.get("reason", "Exit Triggered")
 
+                        # Record closed trade in DB
                         record_trade_db(
                             token_symbol=symbol,
                             action="SELL",
-                            amount=amt,
-                            entry_price=entry,
-                            exit_price=closed.get("exit_price", current_price),
+                            amount=trade_amt,
+                            entry_price=entry_price,
+                            exit_price=exit_price,
                             pnl=pnl,
                             status="CLOSED"
                         )
 
+                        # Send Position Closed Alert
                         alert_msg = (
                             f"🏁 *Position Closed!*\n"
                             f"• Pair: `{symbol}`\n"
-                            f"• Reason: `{closed.get('reason', 'Exit Target')}`\n"
-                            f"• Exit Price: `${closed.get('exit_price', current_price):.4f}`\n"
+                            f"• Reason: `{reason}`\n"
+                            f"• Exit Price: `${exit_price:.4f}`\n"
                             f"• Trade PnL: `${pnl:+.2f}`\n"
                             f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
                         )
@@ -95,11 +99,10 @@ class MultiTokenBot:
                         )
 
                     if signal == "BUY":
-                        # Dynamic sizing: 2% of capital or max available safely
                         if hasattr(self.engine, "calculate_position_size"):
                             trade_amount = self.engine.calculate_position_size()
                         else:
-                            trade_amount = round(self.engine.cash_balance * 0.05, 2)
+                            trade_amount = round(self.engine.cash_balance * 0.02, 2)
                         
                         trade_amount = max(10.0, min(trade_amount, self.engine.cash_balance))
 
