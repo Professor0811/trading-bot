@@ -9,8 +9,9 @@ from paper_engine import PaperTradingEngine
 from telegram_alerts import send_telegram_alert
 
 DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Exact Token Mint addresses on Solana & Direct Price APIs
 TOKENS = {
     "SOL/USDC": {
         "dex_url": "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
@@ -28,19 +29,13 @@ TOKENS = {
 
 
 def fetch_live_price(symbol: str, cfg: dict) -> tuple[float, float]:
-    """
-    Fetches real-time market price:
-    1. Direct on-chain DexScreener token endpoint
-    2. Instant Binance public price fallback (100% reliable real market price)
-    """
-    # 1. Try DexScreener Token API
+    """Fetches real-time market price via DexScreener with Binance fallback."""
     try:
         res = requests.get(cfg["dex_url"], timeout=4)
         if res.status_code == 200:
             data = res.json()
             pairs = data.get("pairs") or []
             if isinstance(pairs, list) and len(pairs) > 0:
-                # Select top pool by liquidity
                 top_pair = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0.0) or 0.0))
                 price = float(top_pair.get("priceUsd", 0.0))
                 liquidity = float(top_pair.get("liquidity", {}).get("usd", 50000.0))
@@ -49,13 +44,11 @@ def fetch_live_price(symbol: str, cfg: dict) -> tuple[float, float]:
     except Exception:
         pass
 
-    # 2. Instant Binance Fallback for 100% accuracy (~$93.5 for SOL)
     try:
         b_sym = cfg["binance_symbol"]
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_sym}", timeout=3)
         if res.status_code == 200:
             raw_price = float(res.json()["price"])
-            # Adjust if 1000BONK
             if b_sym == "1000BONKUSDT":
                 raw_price = raw_price / 1000.0
             return raw_price, 100000.0
@@ -91,7 +84,76 @@ class MultiTokenBot:
             self.engine.cash_balance = 1000.0
             
         self.is_running = True
+        self.trading_enabled = True
+        self.latest_prices = {}
         self.price_history = {s: [] for s in TOKENS}
+
+    async def telegram_command_listener(self):
+        """Polls Telegram updates to respond to user interactive commands."""
+        if not BOT_TOKEN:
+            return
+
+        last_update_id = 0
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+
+        while self.is_running:
+            try:
+                params = {"timeout": 10, "offset": last_update_id + 1}
+                res = await asyncio.to_thread(requests.get, url, params=params, timeout=12)
+                if res.status_code == 200:
+                    data = res.json()
+                    for item in data.get("result", []):
+                        last_update_id = item["update_id"]
+                        msg = item.get("message", {})
+                        text = msg.get("text", "").strip()
+                        sender_id = str(msg.get("chat", {}).get("id", ""))
+
+                        # Authorization check: only execute commands from your CHAT_ID
+                        if CHAT_ID and sender_id != str(CHAT_ID):
+                            continue
+
+                        if text == "/status":
+                            pos = self.engine.active_position
+                            pos_desc = "None (Flat)"
+                            if pos:
+                                pos_desc = f"{pos.get('symbol')} | Entry: ${pos.get('entry_price', 0):.4f} | TP: ${pos.get('tp_price', 0):.4f}"
+
+                            status_reply = (
+                                f"📊 *Trading Bot Status:*\n"
+                                f"• Engine State: `{'TRADING ACTIVE' if self.trading_enabled else 'PAUSED'}`\n"
+                                f"• Cash Balance: `${self.engine.cash_balance:.2f}`\n"
+                                f"• Realized PnL: `${self.engine.realized_pnl:+.2f}`\n"
+                                f"• Active Trade: `{pos_desc}`"
+                            )
+                            send_telegram_alert(status_reply)
+
+                        elif text == "/stop":
+                            self.trading_enabled = False
+                            send_telegram_alert("🛑 *Trading Paused!* Bot will not take any new positions.")
+
+                        elif text == "/start":
+                            self.trading_enabled = True
+                            send_telegram_alert("▶️ *Trading Resumed!* Market scanning active.")
+
+                        elif text == "/closeall":
+                            if self.engine.active_position:
+                                sym = self.engine.active_position.get("symbol")
+                                cur_p = self.latest_prices.get(sym, self.engine.active_position.get("entry_price", 0))
+                                closed = self.engine.check_exit_conditions(cur_p)
+                                if not closed:
+                                    if hasattr(self.engine, "close_position"):
+                                        closed = self.engine.close_position(cur_p, "Manual /closeall")
+                                    elif hasattr(self.engine, "_close_position"):
+                                        closed = self.engine._close_position(0.0, "Manual /closeall", cur_p)
+
+                                send_telegram_alert(f"⚠️ *Manual Exit Triggered!* Position on `{sym}` closed.")
+                            else:
+                                send_telegram_alert("ℹ️ *No open positions* to close.")
+
+            except Exception as e:
+                print(f"[Telegram Listener Error]: {e}")
+
+            await asyncio.sleep(2)
 
     async def monitor_token(self, symbol: str, cfg: dict):
         print(f"[{symbol}] Tracking live market price stream...")
@@ -100,6 +162,7 @@ class MultiTokenBot:
             try:
                 # 1. Fetch exact live market tick
                 current_price, liquidity = await asyncio.to_thread(fetch_live_price, symbol, cfg)
+                self.latest_prices[symbol] = current_price
 
                 history = self.price_history[symbol]
                 history.append(current_price)
@@ -148,8 +211,8 @@ class MultiTokenBot:
                         )
                         send_telegram_alert(alert_msg)
 
-                # 3. Evaluate Entry if flat
-                elif not self.engine.active_position:
+                # 3. Evaluate Entry if flat and trading is enabled
+                elif not self.engine.active_position and self.trading_enabled:
                     signal = strategy_agent.evaluate_market(
                         trend=trend,
                         rsi=rsi,
@@ -201,8 +264,10 @@ class MultiTokenBot:
             await asyncio.sleep(6)
 
     async def run_parallel_trading(self):
-        send_telegram_alert("🚀 *Autonomous Trading Bot: Live Market Feed Synchronized!* Live market price tracking enabled.")
+        send_telegram_alert("🚀 *Autonomous Trading Bot Live!* Interactive commands enabled (`/status`, `/stop`, `/start`, `/closeall`).")
+        # Run market monitors and telegram command listener concurrently
         tasks = [self.monitor_token(symbol, cfg) for symbol, cfg in TOKENS.items()]
+        tasks.append(self.telegram_command_listener())
         await asyncio.gather(*tasks)
 
 
