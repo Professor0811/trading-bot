@@ -6,7 +6,6 @@ from datetime import datetime
 import risk_manager
 import strategy_agent
 from paper_engine import PaperTradingEngine
-from config import STARTING_CAPITAL
 from telegram_alerts import send_telegram_alert
 
 DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
@@ -30,8 +29,16 @@ def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, 
 
 class MultiTokenBot:
     def __init__(self):
-        # Uses starting capital from config
-        self.engine = PaperTradingEngine()
+        # Initialize with $1000 capital if supported, otherwise engine default
+        try:
+            self.engine = PaperTradingEngine(initial_capital=1000.0)
+        except TypeError:
+            self.engine = PaperTradingEngine()
+        
+        # Ensure sufficient balance
+        if getattr(self.engine, "cash_balance", 0) < 100:
+            self.engine.cash_balance = 1000.0
+            
         self.is_running = True
 
     async def monitor_token(self, symbol: str):
@@ -49,23 +56,26 @@ class MultiTokenBot:
                 if self.engine.active_position and self.engine.active_position.get("symbol") == symbol:
                     closed = self.engine.check_exit_conditions(current_price)
                     if closed:
-                        # Record closed trade into DB
+                        amt = self.engine.active_position.get("amount") or self.engine.active_position.get("amount_usd", 20.0)
+                        entry = self.engine.active_position.get("entry_price", current_price)
+                        pnl = closed.get("pnl", 0.0)
+
                         record_trade_db(
                             token_symbol=symbol,
                             action="SELL",
-                            amount=50.0,
-                            entry_price=closed.get("entry_price", current_price),
+                            amount=amt,
+                            entry_price=entry,
                             exit_price=closed.get("exit_price", current_price),
-                            pnl=closed.get("pnl", 0.0),
+                            pnl=pnl,
                             status="CLOSED"
                         )
-                        # Send Instant Close Alert to Telegram
+
                         alert_msg = (
                             f"🏁 *Position Closed!*\n"
                             f"• Pair: `{symbol}`\n"
                             f"• Reason: `{closed.get('reason', 'Exit Target')}`\n"
                             f"• Exit Price: `${closed.get('exit_price', current_price):.4f}`\n"
-                            f"• Trade PnL: `${closed.get('pnl', 0.0):+.2f}`\n"
+                            f"• Trade PnL: `${pnl:+.2f}`\n"
                             f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
                         )
                         send_telegram_alert(alert_msg)
@@ -85,8 +95,14 @@ class MultiTokenBot:
                         )
 
                     if signal == "BUY":
-                        trade_amount = 50.0
-                        # Execute paper order (compatible with boolean or dict return)
+                        # Dynamic sizing: 2% of capital or max available safely
+                        if hasattr(self.engine, "calculate_position_size"):
+                            trade_amount = self.engine.calculate_position_size()
+                        else:
+                            trade_amount = round(self.engine.cash_balance * 0.05, 2)
+                        
+                        trade_amount = max(10.0, min(trade_amount, self.engine.cash_balance))
+
                         order_success = self.engine.execute_order(symbol, "BUY", trade_amount, current_price)
                         
                         if order_success:
@@ -95,7 +111,6 @@ class MultiTokenBot:
                             tp_p = pos.get("tp_price", entry_p * 1.05)
                             sl_p = pos.get("sl_price", entry_p * 0.97)
 
-                            # Record open BUY trade into SQLite DB
                             record_trade_db(
                                 token_symbol=symbol,
                                 action="BUY",
@@ -104,13 +119,13 @@ class MultiTokenBot:
                                 status="OPEN"
                             )
 
-                            # Send Instant BUY Alert to Telegram
                             alert_msg = (
                                 f"🔔 *Trade Executed (BUY)*\n"
                                 f"• Pair: `{symbol}`\n"
                                 f"• Entry Price: `${entry_p:.4f}`\n"
-                                f"• Take-Profit (TP): `${tp_p:.4f}`\n"
-                                f"• Stop-Loss (SL): `${sl_p:.4f}`\n"
+                                f"• Amount: `${trade_amount:.2f}`\n"
+                                f"• TP Target: `${tp_p:.4f}`\n"
+                                f"• SL Target: `${sl_p:.4f}`\n"
                                 f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
                             )
                             send_telegram_alert(alert_msg)
