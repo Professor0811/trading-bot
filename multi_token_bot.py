@@ -1,14 +1,32 @@
 import asyncio
 import random
+import sqlite3
+import os
 from datetime import datetime
 import risk_manager
 import strategy_agent
 from paper_engine import PaperTradingEngine
 from config import STARTING_CAPITAL
-from trade_logger import log_trade
+from telegram_alerts import send_telegram_alert
 
-# List of target tokens to trade in parallel
+DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 WATCH_LIST = ["SOL/USDC", "BONK/USDC", "JUP/USDC"]
+
+
+def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, pnl=0.0, status="OPEN"):
+    """Persist trade execution and exit records to SQLite."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO trades (token_symbol, action, amount, entry_price, exit_price, pnl, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (token_symbol, action, amount, entry_price, exit_price, pnl, status))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB Error]: {e}")
+
 
 class MultiTokenBot:
     def __init__(self):
@@ -17,65 +35,93 @@ class MultiTokenBot:
 
     async def monitor_token(self, symbol: str):
         print(f"[{symbol}] Starting asynchronous market monitor...")
-        
+
         while self.is_running:
-            # Check daily loss limit circuit breaker
-            if risk_manager.check_daily_loss_limit(self.engine.realized_pnl):
-                print("🚨 Daily Loss Limit hit across bot. Stopping all token monitors.")
+            # Check risk daily drawdown limit
+            current_drawdown = max(0.0, -self.engine.realized_pnl)
+            if hasattr(risk_manager, "check_daily_loss_limit") and risk_manager.check_daily_loss_limit(self.engine.realized_pnl):
+                alert_text = f"🚨 *Circuit Breaker Triggered!*\nDaily loss limit reached: `-${current_drawdown:.2f}`. Stopping bot."
+                send_telegram_alert(alert_text)
                 self.is_running = False
                 break
 
-            # Simulated live market data fetch for the specific token
+            # Simulated real-time price & indicator feed
             current_price = 150.0 + random.uniform(-5.0, 5.0)
-            rsi = random.randint(40, 70)
+            rsi = random.randint(40, 75)
             momentum = random.uniform(0.5, 2.0)
             liquidity = random.uniform(20000.0, 100000.0)
-            honeypot = False
-            macd = random.uniform(0.1, 1.5)
-            macd_sig = random.uniform(0.1, 0.8)
-            bb_lower = current_price * 0.95
 
-            print(f"[{symbol}] Price: ${current_price:.2f} | RSI: {rsi} | Wallet: ${self.engine.cash_balance:.2f}")
-
-            # Check existing position exits
+            # Check open position exits (SL / TP)
             if self.engine.active_position and self.engine.active_position["symbol"] == symbol:
                 closed = self.engine.check_exit_conditions(current_price)
                 if closed:
-                    print(f"[{symbol}] Closed Position: {closed['reason']} | PnL: ${closed['pnl']:+.2f}\n")
-            
-            # Evaluate entry signal if no active position
+                    record_trade_db(
+                        token_symbol=symbol,
+                        action="SELL",
+                        amount=closed.get("amount", 50.0),
+                        entry_price=self.engine.active_position["entry_price"],
+                        exit_price=closed["exit_price"],
+                        pnl=closed["pnl"],
+                        status="CLOSED"
+                    )
+                    alert_msg = (
+                        f"🏁 *Position Closed!*\n"
+                        f"• Token: `{symbol}`\n"
+                        f"• Reason: `{closed['reason']}`\n"
+                        f"• Exit: `${closed['exit_price']:.4f}`\n"
+                        f"• Trade PnL: `${closed['pnl']:+.2f}`\n"
+                        f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
+                    )
+                    send_telegram_alert(alert_msg)
+
+            # Check new entry signals if flat
             elif not self.engine.active_position:
                 signal = strategy_agent.evaluate_market(
-                    trend="UP", rsi=rsi, momentum=momentum, 
-                    liquidity_usd=liquidity, macd=macd, macd_signal=macd_sig, 
-                    price=current_price, bb_lower=bb_lower, news_feed="Parallel market surge"
+                    trend="UP",
+                    rsi=rsi,
+                    momentum=momentum,
+                    liquidity_usd=liquidity
                 )
-                
-                if signal == "BUY":
-                    trade_amt = self.engine.calculate_position_size() # 2% of capital ($1.00)
-                    if risk_manager.validate_pre_trade_safety(
-                        trade_amount=trade_amt, estimated_slippage=0.005,
-                        liquidity_usd=liquidity, is_honeypot=honeypot
-                    ):
-                        self.engine.execute_order(symbol, "BUY", trade_amt, current_price)
 
-            # Asynchronous delay between ticks for this token
-            await asyncio.sleep(3)
+                if signal == "BUY":
+                    trade_amt = 50.0
+                    if risk_manager.validate_pre_trade_safety(
+                        trade_amount=trade_amt,
+                        estimated_slippage=0.005,
+                        liquidity_usd=liquidity,
+                        is_honeypot=False
+                    ):
+                        order = self.engine.execute_order(symbol, "BUY", trade_amt, current_price)
+                        if order:
+                            record_trade_db(
+                                token_symbol=symbol,
+                                action="BUY",
+                                amount=trade_amt,
+                                entry_price=order["exec_price"],
+                                status="OPEN"
+                            )
+                            alert_msg = (
+                                f"🔔 *Order Executed (BUY)*\n"
+                                f"• Token: `{symbol}`\n"
+                                f"• Price: `${order['exec_price']:.4f}`\n"
+                                f"• TP Target: `${order.get('tp_price', 0):.4f}`\n"
+                                f"• SL Target: `${order.get('sl_price', 0):.4f}`\n"
+                                f"• Available Balance: `${self.engine.cash_balance:.2f}`"
+                            )
+                            send_telegram_alert(alert_msg)
+
+            await asyncio.sleep(5)
 
     async def run_parallel_trading(self):
-        print("==================================================")
-        print(" 🚀 STARTING MULTI-TOKEN PARALLEL TRADING BOT 🚀 ")
-        print("==================================================")
-        print(f"Watching Pairs: {WATCH_LIST}")
-        print(f"Starting Capital: ${STARTING_CAPITAL} | 2% Position Sizing Active\n")
-
-        # Run monitors for all tokens concurrently using asyncio.gather
+        print(f"Starting parallel monitoring on {WATCH_LIST}")
+        send_telegram_alert("🚀 *Autonomous Trading Bot Started Live on Render!* Monitoring pairs: `SOL`, `BONK`, `JUP`.")
         tasks = [self.monitor_token(symbol) for symbol in WATCH_LIST]
         await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     bot = MultiTokenBot()
     try:
         asyncio.run(bot.run_parallel_trading())
     except KeyboardInterrupt:
-        print("\nBot stopped manually by user.")
+        print("Bot stopped by user.")
