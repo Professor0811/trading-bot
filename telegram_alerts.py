@@ -1,26 +1,25 @@
-import urllib.request
-import urllib.parse
-import json
+import os
+import requests
 
-TELEGRAM_BOT_TOKEN = "9170772758:AAEsidX-dJkZ7A0K85JZdx0A-mov3uqIm4w"
-TELEGRAM_CHAT_ID = "5449445315"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-def send_telegram_alert(message):
+
+def send_telegram_alert(message: str):
+    """Send formatted alert messages to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not configured.")
+        print(f"[Telegram Alert Skipped - Missing Credentials]: {message}")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
+        "text": message,
+        "parse_mode": "Markdown"
     }
-
     try:
-        data = urllib.parse.urlencode(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8"))
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code != 200:
+            print(f"[Telegram Error]: {response.text}")
     except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
-        return None
+        print(f"[Telegram Exception]: {e}")
