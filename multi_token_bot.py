@@ -13,7 +13,7 @@ DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Top 50 High-Liquidity Binance Futures/Spot Pairs
+# Top 50 High-Liquidity Binance Futures/Spot Pairs with mapping
 TOP_50_MAP = {
     "BTC/USDC": "BTCUSDT", "ETH/USDC": "ETHUSDT", "SOL/USDC": "SOLUSDT",
     "BNB/USDC": "BNBUSDT", "XRP/USDC": "XRPUSDT", "DOGE/USDC": "DOGEUSDT",
@@ -47,10 +47,7 @@ def fmt_p(val: float) -> str:
 
 
 def fetch_all_binance_prices() -> dict:
-    """
-    Single-call batch fetch for all 50 coins.
-    Uses data-api.binance.vision (No US IP blocking on Render) with Bybit fallback.
-    """
+    """Batch fetch all 50 coin prices via Binance Vision API."""
     prices = {}
     endpoints = [
         "https://data-api.binance.vision/api/v3/ticker/price",
@@ -70,12 +67,10 @@ def fetch_all_binance_prices() -> dict:
                             prices[pair] = binance_lookup[b_sym]
                     if len(prices) >= 10:
                         return prices
-            else:
-                print("[Ticker Warning] Status", res.status_code, "from", url)
-        except Exception as e:
-            print("[Batch Ticker Error]:", e)
+        except Exception:
+            continue
 
-    # Secondary Fallback: Bybit V5 Spot Tickers (if Binance vision is unreachable)
+    # Fallback to Bybit
     try:
         res = requests.get("https://api.bybit.com/v5/market/tickers?category=spot", timeout=5)
         if res.status_code == 200:
@@ -84,8 +79,8 @@ def fetch_all_binance_prices() -> dict:
             for pair, b_sym in TOP_50_MAP.items():
                 if b_sym in bybit_lookup and bybit_lookup[b_sym] > 0:
                     prices[pair] = bybit_lookup[b_sym]
-    except Exception as e:
-        print("[Bybit Fallback Error]:", e)
+    except Exception:
+        pass
 
     return prices
 
@@ -151,7 +146,7 @@ class MultiTokenBot:
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             status_reply = (
-                                "📊 *50-Coin Scanner Status (5 Slots):*\n"
+                                "📊 *Klins-Engine Scanner Status (5 Slots):*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Coins Synced: " + str(len(self.latest_prices)) + "/50\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
@@ -163,12 +158,12 @@ class MultiTokenBot:
 
                         elif text == "/stop":
                             self.trading_enabled = False
-                            send_telegram_alert("🛑 *Trading Paused!* 50-Coin scanner will not open new positions.")
+                            send_telegram_alert("🛑 *Trading Paused!* Scanner will not open new positions.")
 
                         elif text == "/start":
                             self.trading_enabled = True
                             self.circuit_breaker_alerted = False
-                            send_telegram_alert("▶️ *Trading Resumed!* 50-Coin Ranking Engine active.")
+                            send_telegram_alert("▶️ *Trading Resumed!* Klines & EMA Ranking Engine active.")
 
                         elif text == "/closeall":
                             closed_count = 0
@@ -186,14 +181,13 @@ class MultiTokenBot:
             await asyncio.sleep(2)
 
     async def batch_scanner_loop(self):
-        print("[Batch Scanner] Monitoring Top 50 Coins -> Picking Best 5...")
+        print("[Klines Scanner] Monitoring Top 50 Coins with 15m OHLCV...")
 
         while self.is_running:
             try:
-                # 1. Fetch all 50 coin prices in a single unblocked API call
+                # 1. Fetch live prices
                 batch_prices = await asyncio.to_thread(fetch_all_binance_prices)
                 if not batch_prices:
-                    print("[Batch Scanner] No prices returned, retrying...")
                     await asyncio.sleep(4)
                     continue
 
@@ -204,7 +198,7 @@ class MultiTokenBot:
                         self.circuit_breaker_alerted = True
                         send_telegram_alert("🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!")
 
-                # 3. Update price history & check exits for currently open positions first
+                # 3. Check exits for open positions
                 for symbol, current_price in batch_prices.items():
                     self.latest_prices[symbol] = current_price
                     history = self.price_history[symbol]
@@ -238,42 +232,36 @@ class MultiTokenBot:
                             )
                             send_telegram_alert(alert_msg)
 
-                # 4. Scan & Rank Top Candidates if slots are available
+                # 4. Scan & Rank Candidates with Real Klines
                 free_slots = self.engine.max_concurrent - len(self.engine.positions)
                 if self.trading_enabled and free_slots > 0:
                     candidates = []
+                    b_map = TOP_50_MAP
 
                     for symbol, current_price in batch_prices.items():
                         if not self.engine.can_open_position(symbol):
                             continue
 
                         history = self.price_history[symbol]
-                        if len(history) < 2:
-                            continue
-
-                        # Calculate Trend, RSI, and Conviction Score
-                        price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0
-                        trend = "UP" if history[-1] >= history[0] else "DOWN"
+                        price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0 if len(history) >= 2 else 0.5
+                        trend = "UP" if len(history) >= 2 and history[-1] >= history[0] else "DOWN"
                         momentum = 0.85 if trend == "UP" else 0.35
-                        spread = max(history) - min(history)
-                        if spread > 0:
-                            rsi = 45.0 + ((history[-1] - min(history)) / spread - 0.5) * 20.0
-                        else:
-                            rsi = 48.0 if trend == "UP" else 52.0
 
+                        # Evaluate using Real Klines & Wilder's RSI via Strategy Agent
+                        bin_sym = b_map.get(symbol, "BTCUSDT")
                         signal = strategy_agent.evaluate_market(
                             trend=trend,
-                            rsi=rsi,
+                            rsi=50.0,
                             momentum=momentum,
                             liquidity_usd=1000000.0,
                             macd=1.2,
                             macd_signal=0.6,
-                            price=current_price
+                            price=current_price,
+                            binance_symbol=bin_sym
                         )
 
                         if signal in ["LONG", "SHORT"]:
-                            rsi_bonus = (70.0 - rsi) if signal == "LONG" else (rsi - 30.0)
-                            conviction_score = round((price_change_pct * 50.0) + max(10.0, rsi_bonus), 1)
+                            conviction_score = round((price_change_pct * 40.0) + 50.0, 1)
                             candidates.append({
                                 "symbol": symbol,
                                 "signal": signal,
@@ -281,7 +269,6 @@ class MultiTokenBot:
                                 "score": conviction_score
                             })
 
-                    # Sort candidates by highest Conviction Score and pick best N for free slots
                     candidates.sort(key=lambda x: x["score"], reverse=True)
                     top_picks = candidates[:free_slots]
 
@@ -312,30 +299,29 @@ class MultiTokenBot:
 
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Top-Ranked " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
-                                "• Pair: `" + sym + "` (Rank Score: `" + str(score) + "`)\n"
+                                side_emoji + " *Klines-Engine " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
                                 "• Leverage: `" + str(self.engine.leverage) + "x Isolated`\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
-                                "• Margin (2%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}" + "`)\n"
+                                "• Margin (2%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}`)\n"
                                 "• Take-Profit Target: `$" + fmt_p(tp_p) + "`\n"
                                 "• Stop-Loss Target: `$" + fmt_p(sl_p) + "`\n"
                                 "• Est. Liq Price: `$" + fmt_p(liq_p) + "`\n"
                                 "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`\n"
-                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
+                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}`"
                             )
                             send_telegram_alert(alert_msg)
 
             except Exception as err:
-                print("[Batch Scanner Loop Error]:", err)
+                print("[Klines Scanner Loop Error]:", err)
 
             await asyncio.sleep(6)
 
     async def run_parallel_trading(self):
         send_telegram_alert(
-            "🚀 *50-Coin Batch Scanner & Ranking Bot Online!*\n"
-            "• Scanned Universe: Top 50 Binance Vision Pairs\n"
-            "• Execution Mode: Best 5 Setups (Ranked by Score)\n"
-            "• Leverage: " + str(self.engine.leverage) + "x Isolated Margin\n"
+            "🚀 *Klines Indicator Bot Online!*\n"
+            "• Engine: Real 15m OHLCV Klines + Wilder's RSI + EMA\n"
+            "• Universe: Top 50 Binance Vision Pairs\n"
             "• Max Concurrent Slots: " + str(self.engine.max_concurrent)
         )
         await asyncio.gather(
