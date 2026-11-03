@@ -33,7 +33,7 @@ TOKENS = {
 
 
 def fmt_p(val: float) -> str:
-    """Format prices for macro and micro tokens."""
+    """Safely format prices across macro and micro scales."""
     if val is None:
         return "0.00"
     val = float(val)
@@ -45,14 +45,11 @@ def fmt_p(val: float) -> str:
 
 
 def fetch_live_price(symbol: str, cfg: dict) -> tuple:
-    """
-    Primary: Binance Official Ticker (Accurate price feed).
-    Fallback: DexScreener Solana Pair.
-    """
+    """Primary: Binance Official Ticker API. Fallback: DexScreener."""
     # 1. Primary: Binance API
     try:
         b_sym = cfg["binance_symbol"]
-        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_sym}", timeout=3)
+        res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=" + b_sym, timeout=3)
         if res.status_code == 200:
             raw_price = float(res.json()["price"])
             if b_sym == "1000BONKUSDT":
@@ -77,7 +74,7 @@ def fetch_live_price(symbol: str, cfg: dict) -> tuple:
                     return cfg["fallback"], 50000.0
                 return price, liquidity
     except Exception as e:
-        print(f"[{symbol} DEX Fallback Error]: {e}")
+        print("[DEX Fallback Error]:", e)
 
     return cfg["fallback"], 50000.0
 
@@ -94,7 +91,7 @@ def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, 
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[DB Error]: {e}")
+        print("[DB Error]:", e)
 
 
 class MultiTokenBot:
@@ -115,7 +112,7 @@ class MultiTokenBot:
             return
 
         last_update_id = 0
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        url = "https://api.telegram.org/bot" + BOT_TOKEN + "/getUpdates"
 
         while self.is_running:
             try:
@@ -135,30 +132,33 @@ class MultiTokenBot:
                         if text == "/status":
                             active_desc = []
                             for sym, p in self.engine.positions.items():
-                                active_desc.append(
-                                    f"• {sym} ({p['side']} {self.engine.leverage}x): Margin ${p['margin']:.2f} | "
-                                    f"Entry ${fmt_p(p['entry_price'])} \vert{} TP${fmt_p(p['tp_price'])}"
-                                )
+                                entry_str = fmt_p(p["entry_price"])
+                                tp_str = fmt_p(p["tp_price"])
+                                side_str = p["side"]
+                                margin_str = f"{p['margin']:.2f}"
+                                line = "• " + sym + " (" + side_str + " " + str(self.engine.leverage) + "x): Margin $" + margin_str + " | Entry $" + entry_str + " | TP $" + tp_str
+                                active_desc.append(line)
                             pos_text = "\n".join(active_desc) if active_desc else "None (0/3 Active Slots)"
 
+                            state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             status_reply = (
-                                f"📊 *{self.engine.leverage}x Futures Bot Status:*\n"
-                                f"• Engine State: {'ACTIVE' if self.trading_enabled else 'PAUSED'}\n"
-                                f"• Available Cash: ${self.engine.cash_balance:.2f}\n"
-                                f"• Realized PnL: ${self.engine.realized_pnl:+.2f}\n"
-                                f"• Active Slots: {len(self.engine.positions)}/{self.engine.max_concurrent}\n"
-                                f"{pos_text}"
+                                "📊 *" + str(self.engine.leverage) + "x Futures Bot Status:*\n"
+                                "• Engine State: " + state_str + "\n"
+                                "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
+                                "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
+                                "• Active Slots: " + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "\n"
+                                + pos_text
                             )
                             send_telegram_alert(status_reply)
 
                         elif text == "/stop":
                             self.trading_enabled = False
-                            send_telegram_alert(f"🛑 *Trading Paused!* No new {self.engine.leverage}x positions will be opened.")
+                            send_telegram_alert("🛑 *Trading Paused!* No new positions will be opened.")
 
                         elif text == "/start":
                             self.trading_enabled = True
                             self.circuit_breaker_alerted = False
-                            send_telegram_alert(f"▶️ *Trading Resumed!* {self.engine.leverage}x Bi-directional scanner active.")
+                            send_telegram_alert("▶️ *Trading Resumed!* Scanner active.")
 
                         elif text == "/closeall":
                             closed_count = 0
@@ -168,19 +168,19 @@ class MultiTokenBot:
                                 if not closed:
                                     closed = self.engine._close_token_position(sym, "Manual /closeall", cur_p)
                                 closed_count += 1
-                            send_telegram_alert(f"⚠️ *Manual Exit Triggered!* Closed {closed_count} position(s).")
+                            send_telegram_alert("⚠️ *Manual Exit Triggered!* Closed " + str(closed_count) + " position(s).")
 
             except Exception as e:
-                print(f"[Telegram Listener Error]: {e}")
+                print("[Telegram Listener Error]:", e)
 
             await asyncio.sleep(2)
 
     async def monitor_token(self, symbol: str, cfg: dict):
-        print(f"[{symbol}] {self.engine.leverage}x Futures monitor online.")
+        print("[" + symbol + "] " + str(self.engine.leverage) + "x monitor online.")
 
         while self.is_running:
             try:
-                # 1. Fetch exact live market tick
+                # 1. Live market tick
                 current_price, liquidity = await asyncio.to_thread(fetch_live_price, symbol, cfg)
                 self.latest_prices[symbol] = current_price
 
@@ -189,7 +189,7 @@ class MultiTokenBot:
                 if len(history) > 20:
                     history.pop(0)
 
-                # Technical momentum and trend evaluation
+                # Technical evaluation
                 if len(history) >= 5:
                     momentum = 0.85 if history[-1] > history[-3] else 0.35
                     trend = "UP" if history[-1] >= history[0] else "DOWN"
@@ -200,23 +200,21 @@ class MultiTokenBot:
                     trend = "UP"
                     rsi = 48.0
 
-                # 2. Check 10% Daily Drawdown Circuit Breaker
+                # 2. Check Circuit Breaker
                 if self.engine.is_circuit_breaker_triggered():
                     if not self.circuit_breaker_alerted:
                         self.trading_enabled = False
                         self.circuit_breaker_alerted = True
-                        send_telegram_alert(
-                            "🚨 *CIRCUIT BREAKER TRIGGERED!* Daily net loss reached 10% of balance. Trading halted for safety!"
-                        )
+                        send_telegram_alert("🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!")
 
-                # 3. Check Exits if position is open
+                # 3. Check Exits
                 if symbol in self.engine.positions:
                     closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
                     if closed:
                         side_name = closed["side"]
                         record_trade_db(
                             token_symbol=symbol,
-                            action=f"CLOSE_{side_name}",
+                            action="CLOSE_" + side_name,
                             amount=closed["margin"],
                             entry_price=closed["entry_price"],
                             exit_price=closed["exit_price"],
@@ -225,16 +223,84 @@ class MultiTokenBot:
                         )
 
                         alert_msg = (
-                            f"🏁 *Futures Position Closed (Slot Freed!)*\n"
-                            f"• Pair: `{symbol}` ({side_name} {self.engine.leverage}x)\n"
-                            f"• Reason: `{closed['reason']}`\n"
-                            f"• Entry Price: `${fmt_p(closed['entry_price'])}`\n"
-                            f"• Exit Price: `${fmt_p(closed['exit_price'])}`\n"
-                            f"• Net PnL: `${closed['pnl']:+.2f}`\n"
-                            f"• Wallet Balance: `${self.engine.cash_balance:.2f}`\n"
-                            f"• Active Slots: `{len(self.engine.positions)}/{self.engine.max_concurrent}`"
+                            "🏁 *Futures Position Closed (Slot Freed!)*\n"
+                            "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
+                            "• Reason: `" + str(closed['reason']) + "`\n"
+                            "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n"
+                            "• Exit Price: `$" + fmt_p(closed['exit_price']) + "`\n"
+                            "• Net PnL: `$" + f"{closed['pnl']:+.2f}" + "`\n"
+                            "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
+                            "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`"
                         )
                         send_telegram_alert(alert_msg)
 
-                # 4. Check Bi-Directional Entry (LONG or SHORT)
-                elif self.trading_enabled and self.engine.can_open_position(symbol
+                # 4. Check Entries
+                elif self.trading_enabled and self.engine.can_open_position(symbol):
+                    signal = strategy_agent.evaluate_market(
+                        trend=trend,
+                        rsi=rsi,
+                        momentum=momentum,
+                        liquidity_usd=liquidity,
+                        macd=1.2,
+                        macd_signal=0.6,
+                        price=current_price
+                    )
+
+                    if signal in ["LONG", "SHORT"]:
+                        margin_amount = self.engine.calculate_position_size()
+                        order_success = self.engine.execute_order(symbol, signal, margin_amount, current_price)
+
+                        if order_success:
+                            pos = self.engine.positions.get(symbol, {})
+                            entry_p = pos.get("entry_price", current_price)
+                            tp_p = pos.get("tp_price", entry_p)
+                            sl_p = pos.get("sl_price", entry_p)
+                            liq_p = pos.get("liq_price", entry_p)
+                            leveraged_size = pos.get("leveraged_size", margin_amount * self.engine.leverage)
+
+                            record_trade_db(
+                                token_symbol=symbol,
+                                action=signal + "_" + str(self.engine.leverage) + "X",
+                                amount=margin_amount,
+                                entry_price=entry_p,
+                                status="OPEN"
+                            )
+
+                            side_emoji = "🟢" if signal == "LONG" else "🔴"
+                            alert_msg = (
+                                side_emoji + " *New " + str(self.engine.leverage) + "x Futures Order (" + signal + ")*\n"
+                                "• Pair: `" + symbol + "`\n"
+                                "• Leverage: `" + str(self.engine.leverage) + "x Isolated`\n"
+                                "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
+                                "• Margin (2%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}" + "`)\n"
+                                "• Take-Profit Target: `$" + fmt_p(tp_p) + "`\n"
+                                "• Stop-Loss Target: `$" + fmt_p(sl_p) + "`\n"
+                                "• Est. Liq Price: `$" + fmt_p(liq_p) + "`\n"
+                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
+                            )
+                            send_telegram_alert(alert_msg)
+
+            except Exception as err:
+                print("[" + symbol + " Loop Error]:", err)
+
+            await asyncio.sleep(6)
+
+    async def run_parallel_trading(self):
+        send_telegram_alert(
+            "🚀 *Autonomous " + str(self.engine.leverage) + "x Futures Bot Online!*\n"
+            "• Mode: Long & Short (Bi-Directional)\n"
+            "• Leverage: " + str(self.engine.leverage) + "x Isolated Margin\n"
+            "• Feed: Binance Real-Time Ticker\n"
+            "• Max Concurrent Slots: 3"
+        )
+        tasks = [self.monitor_token(symbol, cfg) for symbol, cfg in TOKENS.items()]
+        tasks.append(self.telegram_command_listener())
+        await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    bot = MultiTokenBot()
+    try:
+        asyncio.run(bot.run_parallel_trading())
+    except KeyboardInterrupt:
+        print("Bot stopped.")
