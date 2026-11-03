@@ -3,6 +3,7 @@ import sqlite3
 import os
 import requests
 from datetime import datetime
+import config
 import risk_manager
 import strategy_agent
 from paper_engine import PaperTradingEngine
@@ -90,7 +91,10 @@ def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, 
 
 class MultiTokenBot:
     def __init__(self):
-        self.engine = PaperTradingEngine(initial_capital=1000.0, max_concurrent=3)
+        self.engine = PaperTradingEngine(
+            initial_capital=config.STARTING_CAPITAL,
+            max_concurrent=config.MAX_CONCURRENT_TRADES
+        )
         self.is_running = True
         self.trading_enabled = True
         self.circuit_breaker_alerted = False
@@ -98,7 +102,7 @@ class MultiTokenBot:
         self.price_history = {s: [] for s in TOKENS}
 
     async def telegram_command_listener(self):
-        """Poll Telegram for interactive control commands."""
+        """Poll Telegram for interactive commands."""
         if not BOT_TOKEN:
             return
 
@@ -123,27 +127,30 @@ class MultiTokenBot:
                         if text == "/status":
                             active_desc = []
                             for sym, p in self.engine.positions.items():
-                                active_desc.append(f"• `{sym}`: Entry ${fmt_p(p['entry_price'])} | TP ${fmt_p(p['tp_price'])}")
-                            pos_text = "\n".join(active_desc) if active_desc else "None (0/3 Active)"
+                                active_desc.append(
+                                    f"• `{sym}` ({p['side']} 5x): Margin ${p['margin']:.2f} | "
+                                    f"Entry ${fmt_p(p['entry_price'])} | TP ${fmt_p(p['tp_price'])}"
+                                )
+                            pos_text = "\n".join(active_desc) if active_desc else "None (0/3 Active Slots)"
 
                             status_reply = (
-                                f"📊 *Trading Bot Status (Max 3 Slots):*\n"
-                                f"• Engine: `{'ACTIVE' if self.trading_enabled else 'PAUSED'}`\n"
-                                f"• Real-Time Balance: `${self.engine.cash_balance:.2f}`\n"
+                                f"📊 *5x Futures Bot Status (3 Slots):*\n"
+                                f"• Engine State: `{'ACTIVE' if self.trading_enabled else 'PAUSED'}`\n"
+                                f"• Wallet Balance: `${self.engine.cash_balance:.2f}`\n"
                                 f"• Realized PnL: `${self.engine.realized_pnl:+.2f}`\n"
-                                f"• Active Slots: `{len(self.engine.positions)}/3`\n"
+                                f"• Active Slots: `{len(self.engine.positions)}/{self.engine.max_concurrent}`\n"
                                 f"{pos_text}"
                             )
                             send_telegram_alert(status_reply)
 
                         elif text == "/stop":
                             self.trading_enabled = False
-                            send_telegram_alert("🛑 *Trading Paused!* No new entries will be taken.")
+                            send_telegram_alert("🛑 *Trading Paused!* No new Futures positions will be opened.")
 
                         elif text == "/start":
                             self.trading_enabled = True
                             self.circuit_breaker_alerted = False
-                            send_telegram_alert("▶️ *Trading Resumed!* Slot manager & scanner active.")
+                            send_telegram_alert("▶️ *Trading Resumed!* Bi-directional 5x market scanner active.")
 
                         elif text == "/closeall":
                             closed_count = 0
@@ -151,9 +158,9 @@ class MultiTokenBot:
                                 cur_p = self.latest_prices.get(sym, self.engine.positions[sym]["entry_price"])
                                 closed = self.engine.check_exit_conditions_for_token(sym, cur_p)
                                 if not closed:
-                                    closed = self.engine._close_token_position(sym, 0.0, "Manual /closeall", cur_p)
+                                    closed = self.engine._close_token_position(sym, "Manual /closeall", cur_p)
                                 closed_count += 1
-                            send_telegram_alert(f"⚠️ *Manual Exit Triggered!* Closed {closed_count} open position(s).")
+                            send_telegram_alert(f"⚠️ *Manual Exit Triggered!* Closed {closed_count} position(s).")
 
             except Exception as e:
                 print(f"[Telegram Listener Error]: {e}")
@@ -161,7 +168,7 @@ class MultiTokenBot:
             await asyncio.sleep(2)
 
     async def monitor_token(self, symbol: str, cfg: dict):
-        print(f"[{symbol}] Slot monitor active.")
+        print(f"[{symbol}] 5x Futures monitor online.")
 
         while self.is_running:
             try:
@@ -174,14 +181,14 @@ class MultiTokenBot:
                 if len(history) > 20:
                     history.pop(0)
 
-                # Technical momentum evaluation
+                # Technical momentum and trend evaluation
                 if len(history) >= 5:
-                    momentum = 1.0 if history[-1] > history[-3] else 0.4
+                    momentum = 0.85 if history[-1] > history[-3] else 0.35
                     trend = "UP" if history[-1] >= history[0] else "DOWN"
                     spread = max(history) - min(history)
                     rsi = 50.0 + ((history[-1] - min(history)) / (spread + 1e-9) - 0.5) * 30.0
                 else:
-                    momentum = 1.0
+                    momentum = 0.8
                     trend = "UP"
                     rsi = 48.0
 
@@ -191,17 +198,18 @@ class MultiTokenBot:
                         self.trading_enabled = False
                         self.circuit_breaker_alerted = True
                         send_telegram_alert(
-                            "🚨 *CIRCUIT BREAKER TRIGGERED!* Daily net loss reached 10% of balance. Trading paused for safety!"
+                            "🚨 *CIRCUIT BREAKER TRIGGERED!* Daily net loss reached 10% of balance. Trading halted for safety!"
                         )
 
-                # 3. Check Exits if this token has an open position
+                # 3. Check Exits if position is open
                 if symbol in self.engine.positions:
                     closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
                     if closed:
+                        side_name = closed["side"]
                         record_trade_db(
                             token_symbol=symbol,
-                            action="SELL",
-                            amount=closed["amount"],
+                            action=f"CLOSE_{side_name}",
+                            amount=closed["margin"],
                             entry_price=closed["entry_price"],
                             exit_price=closed["exit_price"],
                             pnl=closed["pnl"],
@@ -209,17 +217,18 @@ class MultiTokenBot:
                         )
 
                         alert_msg = (
-                            f"🏁 *Position Closed (Slot Freed!)*\n"
-                            f"• Pair: `{symbol}`\n"
+                            f"🏁 *Futures Position Closed (Slot Freed!)*\n"
+                            f"• Pair: `{symbol}` ({side_name} 5x)\n"
                             f"• Reason: `{closed['reason']}`\n"
+                            f"• Entry Price: `${fmt_p(closed['entry_price'])}`\n"
                             f"• Exit Price: `${fmt_p(closed['exit_price'])}`\n"
-                            f"• Trade PnL: `${closed['pnl']:+.2f}`\n"
-                            f"• New Balance: `${self.engine.cash_balance:.2f}`\n"
-                            f"• Active Slots: `{len(self.engine.positions)}/3`"
+                            f"• Net PnL: `${closed['pnl']:+.2f}`\n"
+                            f"• Wallet Balance: `${self.engine.cash_balance:.2f}`\n"
+                            f"• Active Slots: `{len(self.engine.positions)}/{self.engine.max_concurrent}`"
                         )
                         send_telegram_alert(alert_msg)
 
-                # 4. Check Entry if slot is available & trading enabled
+                # 4. Check Bi-Directional Entry (LONG or SHORT)
                 elif self.trading_enabled and self.engine.can_open_position(symbol):
                     signal = strategy_agent.evaluate_market(
                         trend=trend,
@@ -231,32 +240,38 @@ class MultiTokenBot:
                         price=current_price
                     )
 
-                    if signal == "BUY":
-                        trade_amount = self.engine.calculate_position_size()
-                        order_success = self.engine.execute_order(symbol, "BUY", trade_amount, current_price)
+                    if signal in ["LONG", "SHORT"]:
+                        # 2% Isolated Margin allocation
+                        margin_amount = self.engine.calculate_position_size()
+                        order_success = self.engine.execute_order(symbol, signal, margin_amount, current_price)
 
                         if order_success:
                             pos = self.engine.positions.get(symbol, {})
                             entry_p = pos.get("entry_price", current_price)
-                            tp_p = pos.get("tp_price", entry_p * 1.06)
-                            sl_p = pos.get("sl_price", entry_p * 0.975)
+                            tp_p = pos.get("tp_price", entry_p)
+                            sl_p = pos.get("sl_price", entry_p)
+                            liq_p = pos.get("liq_price", entry_p)
+                            leveraged_size = pos.get("leveraged_size", margin_amount * 5)
 
                             record_trade_db(
                                 token_symbol=symbol,
-                                action="BUY",
-                                amount=trade_amount,
+                                action=f"{signal}_5X",
+                                amount=margin_amount,
                                 entry_price=entry_p,
                                 status="OPEN"
                             )
 
+                            side_emoji = "🟢" if signal == "LONG" else "🔴"
                             alert_msg = (
-                                f"🔔 *Real Market Order (Slot {len(self.engine.positions)}/3)*\n"
+                                f"{side_emoji} *New 5x Futures Order ({signal})*\n"
                                 f"• Pair: `{symbol}`\n"
-                                f"• Live Price: `${fmt_p(entry_p)}`\n"
-                                f"• Position Size (2%): `${trade_amount:.2f}`\n"
-                                f"• Take-Profit: `${fmt_p(tp_p)}`\n"
-                                f"• Stop-Loss: `${fmt_p(sl_p)}`\n"
-                                f"• Balance: `${self.engine.cash_balance:.2f}`"
+                                f"• Leverage: `5x Isolated`\n"
+                                f"• Entry Price: `${fmt_p(entry_p)}`\n"
+                                f"• Margin (2%): `${margin_amount:.2f}` (Exposure: `${leveraged_size:.2f}`)\n"
+                                f"• Take-Profit Target: `${fmt_p(tp_p)}` (+15% ROE)\n"
+                                f"• Stop-Loss Target: `${fmt_p(sl_p)}` (-6% Loss)\n"
+                                f"• Est. Liq Price: `${fmt_p(liq_p)}`\n"
+                                f"• Wallet Balance: `${self.engine.cash_balance:.2f}`"
                             )
                             send_telegram_alert(alert_msg)
 
@@ -267,10 +282,12 @@ class MultiTokenBot:
 
     async def run_parallel_trading(self):
         send_telegram_alert(
-            "🚀 *Autonomous Trading Bot Live!* Real-time prices synchronized.\n"
-            "• 2% Dynamic Sizing\n"
-            "• Max 3 Concurrent Slots\n"
-            "• 10% Daily Circuit Breaker"
+            "🚀 *Autonomous 5x Futures Bot Online!*\n"
+            "• Mode: Long & Short (Bi-Directional)\n"
+            "• Leverage: 5x Isolated Margin\n"
+            "• TP: +3.0% (+15% ROE) | SL: -1.2% (-6%)\n"
+            "• Max Concurrent Slots: 3\n"
+            "• Commands: `/status`, `/stop`, `/start`, `/closeall`"
         )
         tasks = [self.monitor_token(symbol, cfg) for symbol, cfg in TOKENS.items()]
         tasks.append(self.telegram_command_listener())
