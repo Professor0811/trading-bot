@@ -15,7 +15,7 @@ DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Top 50 High-Liquidity Binance Pairs mapping
+# Top 50 High-Liquidity Binance Futures Pairs mapping
 TOP_50_MAP = {
     "BTC/USDC": "BTCUSDT", "ETH/USDC": "ETHUSDT", "SOL/USDC": "SOLUSDT",
     "BNB/USDC": "BNBUSDT", "XRP/USDC": "XRPUSDT", "DOGE/USDC": "DOGEUSDT",
@@ -36,7 +36,6 @@ TOP_50_MAP = {
     "ORDI/USDC": "ORDIUSDT", "PENDLE/USDC": "PENDLEUSDT"
 }
 
-# Reverse lookup for websocket stream matching
 REVERSE_MAP = {v.lower(): k for k, v in TOP_50_MAP.items()}
 
 
@@ -147,7 +146,6 @@ class MultiTokenBot:
             await asyncio.sleep(2)
 
     async def process_tick(self, symbol: str, current_price: float):
-        """Process real-time price tick received from WebSocket stream."""
         try:
             self.latest_prices[symbol] = current_price
             history = self.price_history[symbol]
@@ -181,10 +179,8 @@ class MultiTokenBot:
                         "🏁 *Futures Position Closed (Slot Freed!)*\n"
                         "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                         "• Reason: `" + str(closed['reason']) + "`\n"
-                        "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n"
-                        "• Exit Price: `$" + fmt_p(closed['exit_price']) + "`\n"
-                        "• Net PnL: `$" + f"{closed['pnl']:+.2f}" + "`\n"
-                        "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
+                        "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n" "• Exit Price: `$" + fmt_p(closed['exit_price']) + "`\n"
+                        "• Net PnL: `$" + f"{closed['pnl']:+.2f}" + "`\n" "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
                         "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`"
                     )
                     send_telegram_alert(alert_msg)
@@ -235,61 +231,5 @@ class MultiTokenBot:
                                 side_emoji + " *WebSocket Real-Time " + str(self.engine.leverage) + "x Order (" + signal + ")*\n"
                                 "• Pair: `" + symbol + "` (Score: `" + str(conviction_score) + "`)\n"
                                 "• Leverage: `" + str(self.engine.leverage) + "x Isolated`\n"
-                                "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
-                                "• Margin (2%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}`)\n"
-                                "• Take-Profit Target: `$" + fmt_p(tp_p) + "`\n"
-                                "• Stop-Loss Target: `$" + fmt_p(sl_p) + "`\n"
-                                "• Est. Liq Price: `$" + fmt_p(liq_p) + "`\n"
-                                "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`\n"
-                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
-                            )
-                            send_telegram_alert(alert_msg)
-        except Exception as e:
-            print(f"[Tick Processing Error for {symbol}]:", e)
-
-    async def websocket_stream_listener(self):
-        """Connect to Binance Vision WebSocket mini-ticker stream with auto-reconnection."""
-        uri = "wss://stream.binance.vision:443/ws/!miniTicker@arr"
-        
-        while self.is_running:
-            try:
-                print("[WebSocket] Connecting to Binance Live Stream...")
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as websocket:
-                    print("[WebSocket] Connected successfully!")
-                    send_telegram_alert("🔌 *WebSocket Stream Connected!* Real-time market feed active.")
-                    
-                    async for message in websocket:
-                        if not self.is_running:
-                            break
-                        data = json.loads(message)
-                        if isinstance(data, list):
-                            for item in data:
-                                b_sym = item.get("s", "").lower()
-                                price_str = item.get("c")
-                                if b_sym in REVERSE_MAP and price_str:
-                                    symbol = REVERSE_MAP[b_sym]
-                                    current_price = float(price_str)
-                                    await self.process_tick(symbol, current_price)
-            except Exception as e:
-                print(f"[WebSocket Disconnected / Error]: {e}. Reconnecting in 5 seconds...")
-                await asyncio.sleep(5)
-
-    async def run_parallel_trading(self):
-        send_telegram_alert(
-            "🚀 *WebSocket-Integrated Bot Online!*\n"
-            "• Engine: Real-Time Binance WSS Mini-Tickers\n"
-            "• Indicator Core: 15m Klines + Wilder's RSI + EMA\n"
-            "• Max Concurrent Slots: " + str(self.engine.max_concurrent)
-        )
-        await asyncio.gather(
-            self.websocket_stream_listener(),
-            self.telegram_command_listener()
-        )
-
-
-if __name__ == "__main__":
-    bot = MultiTokenBot()
-    try:
-        asyncio.run(bot.run_parallel_trading())
-    except KeyboardInterrupt:
-        print("Bot stopped.")
+                                "• Entry Price: `$" + fmt_p(entry_p) + "`\n" "• Margin (2\%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}`)\n" "• Take-Profit Target: `$" + fmt_p(tp_p) + "`\n"
+                                "• Stop-Loss Target: `$" + fmt_p(sl_p) + "`\n" "• Est. Liq Price: `$" + fmt_p(liq_
