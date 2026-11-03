@@ -8,20 +8,54 @@ from multi_token_bot import MultiTokenBot
 app = FastAPI(title="Autonomous 5x Futures Bot Monitor")
 
 DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
+
+
+def init_db():
+    """Ensure trades table exists immediately upon app startup."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                token_symbol TEXT,
+                action TEXT,
+                amount REAL,
+                entry_price REAL,
+                exit_price REAL,
+                pnl REAL DEFAULT 0.0,
+                status TEXT DEFAULT 'OPEN'
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("[DB Init]: trades table verified successfully.")
+    except Exception as e:
+        print(f"[DB Init Error]: {e}")
+
+
+# Initialize table right away
+init_db()
+
 bot_instance = MultiTokenBot()
+
 
 @app.on_event("startup")
 async def startup_event():
+    init_db()
     asyncio.create_task(bot_instance.run_parallel_trading())
+
 
 @app.get("/healthz")
 async def health_check():
     return {"status": "ok", "engine": "running"}
 
+
 @app.get("/api/metrics")
 async def get_metrics():
     engine = bot_instance.engine
-    
+
     locked_margin = sum(p.get("margin", 0.0) for p in engine.positions.values())
     total_equity = engine.cash_balance + locked_margin
 
@@ -54,6 +88,7 @@ async def get_metrics():
         "active_slots": f"{len(engine.positions)}/{engine.max_concurrent}"
     }
 
+
 @app.get("/api/trades")
 async def get_trades():
     try:
@@ -82,6 +117,7 @@ async def get_trades():
         return trades
     except Exception:
         return []
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -204,7 +240,7 @@ HTML_TEMPLATE = """
         <div class="metric-card">
             <div class="metric-title">Total Realized PnL</div>
             <div class="metric-value" id="totalPnl">+$0.00</div>
-            <div class="metric-sub">Closed trades net</div>
+            <div class="metric-sub" id="pnlSub">Closed trades net</div>
         </div>
         <div class="metric-card">
             <div class="metric-title">Win Rate / Trades</div>
@@ -341,6 +377,7 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
