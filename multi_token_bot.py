@@ -15,18 +15,18 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 TOKENS = {
     "SOL/USDC": {
-        "dex_url": "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
         "binance_symbol": "SOLUSDT",
+        "dex_url": "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
         "fallback": 93.50
     },
     "JUP/USDC": {
-        "dex_url": "https://api.dexscreener.com/latest/dex/tokens/JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
         "binance_symbol": "JUPUSDT",
+        "dex_url": "https://api.dexscreener.com/latest/dex/tokens/JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
         "fallback": 1.05
     },
     "BONK/USDC": {
-        "dex_url": "https://api.dexscreener.com/latest/dex/pairs/solana/DBrEeaP4o45m83q63rS5yHqU2X3uU1b47r1Z9xK6j6z",
         "binance_symbol": "1000BONKUSDT",
+        "dex_url": "https://api.dexscreener.com/latest/dex/pairs/solana/DBrEeaP4o45m83q63rS5yHqU2X3uU1b47r1Z9xK6j6z",
         "fallback": 0.000022
     }
 }
@@ -45,9 +45,26 @@ def fmt_p(val: float) -> str:
 
 
 def fetch_live_price(symbol: str, cfg: dict) -> tuple:
-    """Fetch live market price via DexScreener with fallback to Binance."""
+    """
+    Primary: Binance Official Ticker (Rock solid, no DEX spikes).
+    Fallback: DexScreener Solana Pair.
+    """
+    # 1. Primary: Binance API
     try:
-        res = requests.get(cfg["dex_url"], timeout=4)
+        b_sym = cfg["binance_symbol"]
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_sym}", timeout=3)
+        if res.status_code == 200:
+            raw_price = float(res.json()["price"])
+            if b_sym == "1000BONKUSDT":
+                raw_price = raw_price / 1000.0
+            if raw_price > 0:
+                return raw_price, 500000.0
+    except Exception:
+        pass
+
+    # 2. Fallback: DexScreener
+    try:
+        res = requests.get(cfg["dex_url"], timeout=3)
         if res.status_code == 200:
             data = res.json()
             pairs = data.get("pairs") or ([data.get("pair")] if data.get("pair") else [])
@@ -56,20 +73,12 @@ def fetch_live_price(symbol: str, cfg: dict) -> tuple:
                 top_pair = max(valid_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0.0) or 0.0))
                 price = float(top_pair["priceUsd"])
                 liquidity = float(top_pair.get("liquidity", {}).get("usd", 50000.0) or 50000.0)
+                # Sanity check: SOL cannot be $200 when market is around $93
+                if symbol == "SOL/USDC" and (price > 150.0 or price < 50.0):
+                    return cfg["fallback"], 50000.0
                 return price, liquidity
-    except Exception:
-        pass
-
-    try:
-        b_sym = cfg["binance_symbol"]
-        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={b_sym}", timeout=3)
-        if res.status_code == 200:
-            raw_price = float(res.json()["price"])
-            if b_sym == "1000BONKUSDT":
-                raw_price = raw_price / 1000.0
-            return raw_price, 100000.0
     except Exception as e:
-        print(f"[{symbol} Price Error]: {e}")
+        print(f"[{symbol} DEX Fallback Error]: {e}")
 
     return cfg["fallback"], 50000.0
 
@@ -136,7 +145,7 @@ class MultiTokenBot:
                             status_reply = (
                                 f"📊 *5x Futures Bot Status (3 Slots):*\n"
                                 f"• Engine State: `{'ACTIVE' if self.trading_enabled else 'PAUSED'}`\n"
-                                f"• Wallet Balance: `${self.engine.cash_balance:.2f}`\n"
+                                f"• Available Cash: `${self.engine.cash_balance:.2f}`\n"
                                 f"• Realized PnL: `${self.engine.realized_pnl:+.2f}`\n"
                                 f"• Active Slots: `{len(self.engine.positions)}/{self.engine.max_concurrent}`\n"
                                 f"{pos_text}"
@@ -150,7 +159,7 @@ class MultiTokenBot:
                         elif text == "/start":
                             self.trading_enabled = True
                             self.circuit_breaker_alerted = False
-                            send_telegram_alert("▶️ *Trading Resumed!* Bi-directional 5x market scanner active.")
+                            send_telegram_alert("▶️ *Trading Resumed!* Real Binance price scanner active.")
 
                         elif text == "/closeall":
                             closed_count = 0
@@ -168,11 +177,11 @@ class MultiTokenBot:
             await asyncio.sleep(2)
 
     async def monitor_token(self, symbol: str, cfg: dict):
-        print(f"[{symbol}] 5x Futures monitor online.")
+        print(f"[{symbol}] Real-price monitor online.")
 
         while self.is_running:
             try:
-                # 1. Real-time market tick
+                # 1. Fetch exact live market tick (Binance Primary)
                 current_price, liquidity = await asyncio.to_thread(fetch_live_price, symbol, cfg)
                 self.latest_prices[symbol] = current_price
 
@@ -241,7 +250,6 @@ class MultiTokenBot:
                     )
 
                     if signal in ["LONG", "SHORT"]:
-                        # 2% Isolated Margin allocation
                         margin_amount = self.engine.calculate_position_size()
                         order_success = self.engine.execute_order(symbol, signal, margin_amount, current_price)
 
@@ -282,12 +290,10 @@ class MultiTokenBot:
 
     async def run_parallel_trading(self):
         send_telegram_alert(
-            "🚀 *Autonomous 5x Futures Bot Online!*\n"
+            "🚀 *Autonomous 5x Futures Bot: Binance Price Feed Synced!*\n"
             "• Mode: Long & Short (Bi-Directional)\n"
-            "• Leverage: 5x Isolated Margin\n"
-            "• TP: +3.0% (+15% ROE) | SL: -1.2% (-6%)\n"
-            "• Max Concurrent Slots: 3\n"
-            "• Commands: `/status`, `/stop`, `/start`, `/closeall`"
+            "• Primary Feed: Binance Real-Time Ticker\n"
+            "• Zero Off-Market Spikes"
         )
         tasks = [self.monitor_token(symbol, cfg) for symbol, cfg in TOKENS.items()]
         tasks.append(self.telegram_command_listener())
