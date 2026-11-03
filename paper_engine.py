@@ -1,36 +1,37 @@
 from datetime import datetime
+import config
 
 class PaperTradingEngine:
     def __init__(self, initial_capital: float = 1000.0, max_concurrent: int = 3):
         self.cash_balance = initial_capital
         self.initial_capital = initial_capital
         self.max_concurrent = max_concurrent
-        # Track active positions per token symbol: {"SOL/USDC": {...}, ...}
+        self.leverage = getattr(config, "LEVERAGE", 5)
+        # Positions dict: {"SOL/USDC": {...}, ...}
         self.positions = {}
         self.realized_pnl = 0.0
         self.day_start_balance = initial_capital
 
     @property
     def active_position(self):
-        """Backward compatibility helper returning the first active position or None."""
         if self.positions:
             return next(iter(self.positions.values()))
         return None
 
     def calculate_position_size(self) -> float:
-        """Calculates exactly 2% of the real-time balance for the next trade."""
-        current_equity = self.cash_balance + sum(p.get("amount", 0.0) for p in self.positions.values())
-        size = current_equity * 0.02
-        return max(5.0, round(size, 2))
+        """Returns 2% of current total equity as isolated margin collateral."""
+        current_equity = self.cash_balance + sum(p.get("margin", 0.0) for p in self.positions.values())
+        margin_size = current_equity * config.POSITION_MARGIN_PERCENT
+        return max(5.0, round(margin_size, 2))
 
     def is_circuit_breaker_triggered(self) -> bool:
-        """Triggers if daily net loss reaches or exceeds 10% of day-start capital."""
-        loss = self.day_start_balance - (self.cash_balance + sum(p.get("amount", 0.0) for p in self.positions.values()))
-        max_allowed_loss = self.day_start_balance * 0.10
+        """Triggers if daily net loss hits 10% of day-start capital."""
+        current_equity = self.cash_balance + sum(p.get("margin", 0.0) for p in self.positions.values())
+        loss = self.day_start_balance - current_equity
+        max_allowed_loss = self.day_start_balance * config.DAILY_LOSS_LIMIT_PERCENT
         return loss >= max_allowed_loss
 
     def can_open_position(self, symbol: str) -> bool:
-        """Ensure we don't exceed max 3 concurrent positions and don't duplicate on same symbol."""
         if len(self.positions) >= self.max_concurrent:
             return False
         if symbol in self.positions:
@@ -39,81 +40,135 @@ class PaperTradingEngine:
             return False
         return True
 
-    def execute_order(self, symbol: str, side: str, amount: float, price: float):
-        if side == "BUY":
-            if not self.can_open_position(symbol):
-                return False
-            
-            if self.cash_balance < amount:
-                return False
+    def execute_order(self, symbol: str, side: str, margin: float, price: float):
+        """
+        Executes a 5x Leveraged Long or Short order using isolated margin.
+        side: 'LONG' (or 'BUY') / 'SHORT' (or 'SELL')
+        """
+        side = "LONG" if side in ["LONG", "BUY"] else "SHORT"
 
-            self.cash_balance -= amount
-            # 6% Take-Profit, 2.5% Stop-Loss (with Trailing logic)
-            tp_price = price * 1.06
-            sl_price = price * 0.975
+        if not self.can_open_position(symbol):
+            return False
 
-            self.positions[symbol] = {
-                "symbol": symbol,
-                "amount": amount,
-                "entry_price": price,
-                "tp_price": tp_price,
-                "sl_price": sl_price,
-                "highest_price": price
-            }
-            return True
-        return False
+        if self.cash_balance < margin:
+            return False
+
+        # Deduct margin from cash balance
+        self.cash_balance -= margin
+        leveraged_size = margin * self.leverage
+        
+        # Deduct opening taker fee on total leveraged notional size
+        open_fee = leveraged_size * config.FUTURES_TAKER_FEE
+        self.cash_balance -= open_fee
+
+        # Calculate TP, SL, and Liquidation Prices based on direction
+        if side == "LONG":
+            tp_price = price * (1.0 + config.TAKE_PROFIT_PERCENT)
+            sl_price = price * (1.0 - config.STOP_LOSS_PERCENT)
+            # Long Liquidation: Price drops ~18.5%
+            liq_price = price * (1.0 - (1.0 / self.leverage - config.MAINTENANCE_MARGIN_PERCENT))
+            extreme_price = price
+        else:  # SHORT
+            tp_price = price * (1.0 - config.TAKE_PROFIT_PERCENT)
+            sl_price = price * (1.0 + config.STOP_LOSS_PERCENT)
+            # Short Liquidation: Price rises ~18.5%
+            liq_price = price * (1.0 + (1.0 / self.leverage - config.MAINTENANCE_MARGIN_PERCENT))
+            extreme_price = price
+
+        self.positions[symbol] = {
+            "symbol": symbol,
+            "side": side,
+            "margin": margin,
+            "leveraged_size": leveraged_size,
+            "entry_price": price,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "liq_price": liq_price,
+            "extreme_price": extreme_price,  # Highest for Long, Lowest for Short
+            "open_fee": open_fee
+        }
+        return True
 
     def check_exit_conditions_for_token(self, symbol: str, current_price: float):
-        """Checks exit rules including Trailing Stop-Loss and Take-Profit for a specific token."""
         if symbol not in self.positions:
             return None
 
         pos = self.positions[symbol]
-
-        # Trailing Stop-Loss update
-        if current_price > pos["highest_price"]:
-            pos["highest_price"] = current_price
-            new_sl = current_price * 0.98
-            if new_sl > pos["sl_price"]:
-                pos["sl_price"] = new_sl
-
+        side = pos["side"]
         reason = None
-        pnl = 0.0
 
-        if current_price >= pos["tp_price"]:
-            reason = "Take-Profit Hit 🎯"
-            pnl = pos["amount"] * ((pos["tp_price"] - pos["entry_price"]) / pos["entry_price"])
-        elif current_price <= pos["sl_price"]:
-            reason = "Stop-Loss / Trailing SL Hit 🛑"
-            pnl = pos["amount"] * ((pos["sl_price"] - pos["entry_price"]) / pos["entry_price"])
+        # 1. Update Trailing Stop-Loss
+        if side == "LONG":
+            if current_price > pos["extreme_price"]:
+                pos["extreme_price"] = current_price
+                new_sl = current_price * (1.0 - config.TRAILING_STOP_PERCENT)
+                if new_sl > pos["sl_price"]:
+                    pos["sl_price"] = new_sl
+
+            # Check Exit Triggers for LONG
+            if current_price <= pos["liq_price"]:
+                reason = "💥 LIQUIDATION HIT"
+            elif current_price >= pos["tp_price"]:
+                reason = "Take-Profit Hit 🎯 (+15% ROE)"
+            elif current_price <= pos["sl_price"]:
+                reason = "Stop-Loss / Trailing SL Hit 🛑"
+
+        else:  # SHORT
+            if current_price < pos["extreme_price"]:
+                pos["extreme_price"] = current_price
+                new_sl = current_price * (1.0 + config.TRAILING_STOP_PERCENT)
+                if new_sl < pos["sl_price"]:
+                    pos["sl_price"] = new_sl
+
+            # Check Exit Triggers for SHORT
+            if current_price >= pos["liq_price"]:
+                reason = "💥 LIQUIDATION HIT"
+            elif current_price <= pos["tp_price"]:
+                reason = "Take-Profit Hit 🎯 (+15% ROE)"
+            elif current_price >= pos["sl_price"]:
+                reason = "Stop-Loss / Trailing SL Hit 🛑"
 
         if reason:
-            return self._close_token_position(symbol, pnl, reason, current_price)
+            return self._close_token_position(symbol, reason, current_price)
 
         return None
 
-    def check_exit_conditions(self, current_price: float):
-        """Backward compatibility check for the first active position."""
-        if not self.positions:
-            return None
-        sym = next(iter(self.positions))
-        return self.check_exit_conditions_for_token(sym, current_price)
-
-    def _close_token_position(self, symbol: str, pnl: float, reason: str, exit_price: float):
+    def _close_token_position(self, symbol: str, reason: str, exit_price: float):
         pos = self.positions.pop(symbol, None)
         if not pos:
             return None
 
-        return_amount = pos["amount"] + pnl
-        self.cash_balance += return_amount
+        side = pos["side"]
+        leveraged_size = pos["leveraged_size"]
+        entry_price = pos["entry_price"]
+        margin = pos["margin"]
+
+        # Calculate Gross PnL
+        if "LIQUIDATION" in reason:
+            pnl = -margin  # Isolated margin is completely wiped out
+            close_fee = 0.0
+        else:
+            if side == "LONG":
+                pnl = leveraged_size * ((exit_price - entry_price) / entry_price)
+            else:  # SHORT
+                pnl = leveraged_size * ((entry_price - exit_price) / entry_price)
+            
+            # Deduct closing taker fee
+            close_fee = leveraged_size * config.FUTURES_TAKER_FEE
+            pnl -= close_fee
+
+        return_capital = max(0.0, margin + pnl)
+        self.cash_balance += return_capital
         self.realized_pnl += pnl
 
         return {
             "symbol": symbol,
+            "side": side,
             "reason": reason,
-            "entry_price": pos["entry_price"],
-            "amount": pos["amount"],
+            "entry_price": entry_price,
             "exit_price": exit_price,
-            "pnl": pnl,
-            "wallet_cash": self.cash_balance
+            "margin": margin,
+            "leveraged_size": leveraged_size,
+            "pnl": round(pnl, 2),
+            "wallet_cash": round(self.cash_balance, 2)
         }
