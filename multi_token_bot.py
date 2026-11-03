@@ -33,7 +33,6 @@ TOKENS = {
 
 
 def fmt_p(val: float) -> str:
-    """Safely format prices across macro and micro scales."""
     if val is None:
         return "0.00"
     val = float(val)
@@ -45,7 +44,6 @@ def fmt_p(val: float) -> str:
 
 
 def fetch_live_price(symbol: str, cfg: dict) -> tuple:
-    """Primary: Binance Official Ticker API. Fallback: DexScreener."""
     # 1. Primary: Binance API
     try:
         b_sym = cfg["binance_symbol"]
@@ -80,7 +78,6 @@ def fetch_live_price(symbol: str, cfg: dict) -> tuple:
 
 
 def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, pnl=0.0, status="OPEN"):
-    """Persist trade records to SQLite."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -107,7 +104,6 @@ class MultiTokenBot:
         self.price_history = {s: [] for s in TOKENS}
 
     async def telegram_command_listener(self):
-        """Poll Telegram commands."""
         if not BOT_TOKEN:
             return
 
@@ -180,7 +176,7 @@ class MultiTokenBot:
 
         while self.is_running:
             try:
-                # 1. Live market tick
+                # 1. Fetch live market price
                 current_price, liquidity = await asyncio.to_thread(fetch_live_price, symbol, cfg)
                 self.latest_prices[symbol] = current_price
 
