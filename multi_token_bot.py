@@ -32,17 +32,19 @@ TOKENS = {
 
 
 def fmt_p(val: float) -> str:
+    """Safely format prices across macro and micro token scales."""
     if val is None:
         return "0.00"
     val = float(val)
     if val < 0.0001:
-        return f"{val:.8f}".rstrip('0').rstrip('.')
+        return f"{val:.8f}".rstrip("0").rstrip(".")
     elif val < 1.0:
         return f"{val:.6f}"
     return f"{val:.4f}"
 
 
-def fetch_live_price(symbol: str, cfg: dict) -> tuple[float, float]:
+def fetch_live_price(symbol: str, cfg: dict) -> tuple:
+    """Fetch live market price via DexScreener with fallback to Binance."""
     try:
         res = requests.get(cfg["dex_url"], timeout=4)
         if res.status_code == 200:
@@ -72,6 +74,7 @@ def fetch_live_price(symbol: str, cfg: dict) -> tuple[float, float]:
 
 
 def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, pnl=0.0, status="OPEN"):
+    """Persist trade execution and exit records to SQLite."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -87,7 +90,6 @@ def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, 
 
 class MultiTokenBot:
     def __init__(self):
-        # Initializing paper engine with max 3 concurrent trades
         self.engine = PaperTradingEngine(initial_capital=1000.0, max_concurrent=3)
         self.is_running = True
         self.trading_enabled = True
@@ -96,6 +98,7 @@ class MultiTokenBot:
         self.price_history = {s: [] for s in TOKENS}
 
     async def telegram_command_listener(self):
+        """Poll Telegram for interactive control commands."""
         if not BOT_TOKEN:
             return
 
@@ -229,7 +232,6 @@ class MultiTokenBot:
                     )
 
                     if signal == "BUY":
-                        # Dynamic 2% of real-time balance
                         trade_amount = self.engine.calculate_position_size()
                         order_success = self.engine.execute_order(symbol, "BUY", trade_amount, current_price)
 
@@ -265,10 +267,10 @@ class MultiTokenBot:
 
     async def run_parallel_trading(self):
         send_telegram_alert(
-            "🚀 *Autonomous Trading Bot: Risk Engine Active!*\n"
-            "• 2% Real-Time Sizing\n"
+            "🚀 *Autonomous Trading Bot Live!* Real-time prices synchronized.\n"
+            "• 2% Dynamic Sizing\n"
             "• Max 3 Concurrent Slots\n"
-            "• 10% Dynamic Circuit Breaker"
+            "• 10% Daily Circuit Breaker"
         )
         tasks = [self.monitor_token(symbol, cfg) for symbol, cfg in TOKENS.items()]
         tasks.append(self.telegram_command_listener())
