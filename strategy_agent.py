@@ -1,41 +1,35 @@
-def verify_liquidity(liquidity_usd: float, min_liquidity: float = 20000.0) -> bool:
-    """Filter out illiquid low-cap pairs prone to high slippage or manipulation."""
-    return liquidity_usd >= min_liquidity
-
+"""
+Strategy Agent: Generates LONG and SHORT trade signals based on 
+trend confluence, RSI pullback exhaustion, and momentum indicators.
+"""
 
 def evaluate_market(
     trend: str,
     rsi: float,
     momentum: float,
     liquidity_usd: float,
-    macd: float = 0.5,
-    macd_signal: float = 0.2,
-    price: float = 150.0,
-    bb_lower: float = 145.0,
-    news_feed: str = "Neutral"
+    macd: float = 0.0,
+    macd_signal: float = 0.0,
+    price: float = 0.0
 ) -> str:
     """
-    Optimized confluence engine targeting 60%+ win rate:
-    - Filters liquidity to avoid illiquid traps.
-    - Requires confirmed uptrend (UP).
-    - Requires optimal RSI pullback zone (RSI between 38 and 58).
-    - Requires positive momentum and MACD bullish cross.
+    Evaluates market conditions for 5x Futures entries:
+    - Returns 'LONG' for oversold pullbacks in an overall Uptrend.
+    - Returns 'SHORT' for overbought rallies in an overall Downtrend.
+    - Returns 'HOLD' when momentum is weak or liquidity is dangerous.
     """
-    # 1. Safety Liquidity Check
-    if not verify_liquidity(liquidity_usd):
+    # 1. Safety Liquidity Filter (Avoid low-cap pump & dumps)
+    if liquidity_usd < 20000.0:
         return "HOLD"
 
-    # 2. Strong BUY Confluence
-    is_trend_bullish = (trend == "UP")
-    is_rsi_sweet_spot = (38.0 <= rsi <= 58.0)
-    is_momentum_positive = (momentum > 0.8)
-    is_macd_bullish = (macd > macd_signal)
+    # 2. LONG Signal: Uptrend + RSI Bullish Pullback Zone (38 - 56) + Positive Momentum
+    if trend == "UP":
+        if 38.0 <= rsi <= 56.0 and momentum >= 0.7:
+            return "LONG"
 
-    if is_trend_bullish and is_rsi_sweet_spot and is_momentum_positive and is_macd_bullish:
-        return "BUY"
-
-    # 3. Defensive Exit / Sell Trigger
-    if trend == "DOWN" or rsi >= 75.0:
-        return "SELL"
+    # 3. SHORT Signal: Downtrend + RSI Overbought Exhaustion (58 - 74) + Negative Momentum
+    elif trend == "DOWN":
+        if 58.0 <= rsi <= 74.0 and momentum <= 0.5:
+            return "SHORT"
 
     return "HOLD"
