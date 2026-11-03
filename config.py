@@ -3,10 +3,10 @@
 # ==========================================
 
 # Capital & Leverage Rules
-STARTING_CAPITAL = 1000.0
+STARTING_CAPITAL = 1000.0[cite: 15]
 LEVERAGE = 10                         # 10x Isolated Leverage Multiplier
 POSITION_MARGIN_PERCENT = 0.02        # 2% Margin per trade ($20 margin -> $200 exposure)
-MAX_CONCURRENT_TRADES = 5             # Max 5 parallel slots
+MAX_CONCURRENT_TRADES = 3             # Max 3 parallel slots
 
 # Risk Limits & Circuit Breaker
 DAILY_LOSS_LIMIT_PERCENT = 0.10       # 10% daily drawdown circuit breaker
