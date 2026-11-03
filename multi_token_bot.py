@@ -47,18 +47,46 @@ def fmt_p(val: float) -> str:
 
 
 def fetch_all_binance_prices() -> dict:
-    """Single-call batch fetch for all 50 coins from Binance."""
+    """
+    Single-call batch fetch for all 50 coins.
+    Uses data-api.binance.vision (No US IP blocking on Render) with Bybit fallback.
+    """
     prices = {}
+    endpoints = [
+        "https://data-api.binance.vision/api/v3/ticker/price",
+        "https://api.binance.com/api/v3/ticker/price",
+        "https://api1.binance.com/api/v3/ticker/price"
+    ]
+
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list):
+                    binance_lookup = {item["symbol"]: float(item["price"]) for item in data if "symbol" in item and "price" in item}
+                    for pair, b_sym in TOP_50_MAP.items():
+                        if b_sym in binance_lookup and binance_lookup[b_sym] > 0:
+                            prices[pair] = binance_lookup[b_sym]
+                    if len(prices) >= 10:
+                        return prices
+            else:
+                print("[Ticker Warning] Status", res.status_code, "from", url)
+        except Exception as e:
+            print("[Batch Ticker Error]:", e)
+
+    # Secondary Fallback: Bybit V5 Spot Tickers (if Binance vision is unreachable)
     try:
-        res = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=5)
+        res = requests.get("https://api.bybit.com/v5/market/tickers?category=spot", timeout=5)
         if res.status_code == 200:
-            data = res.json()
-            binance_lookup = {item["symbol"]: float(item["price"]) for item in data}
+            items = res.json().get("result", {}).get("list", [])
+            bybit_lookup = {item["symbol"]: float(item["lastPrice"]) for item in items if "symbol" in item and "lastPrice" in item}
             for pair, b_sym in TOP_50_MAP.items():
-                if b_sym in binance_lookup and binance_lookup[b_sym] > 0:
-                    prices[pair] = binance_lookup[b_sym]
+                if b_sym in bybit_lookup and bybit_lookup[b_sym] > 0:
+                    prices[pair] = bybit_lookup[b_sym]
     except Exception as e:
-        print("[Batch Ticker Error]:", e)
+        print("[Bybit Fallback Error]:", e)
+
     return prices
 
 
@@ -80,7 +108,7 @@ class MultiTokenBot:
     def __init__(self):
         self.engine = PaperTradingEngine(
             initial_capital=config.STARTING_CAPITAL,
-            max_concurrent=config.MAX_CONCURRENT_TRADES
+            max_concurrent=5
         )
         self.is_running = True
         self.trading_enabled = True
@@ -125,6 +153,7 @@ class MultiTokenBot:
                             status_reply = (
                                 "📊 *50-Coin Scanner Status (5 Slots):*\n"
                                 "• Engine State: " + state_str + "\n"
+                                "• Coins Synced: " + str(len(self.latest_prices)) + "/50\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
                                 "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
                                 "• Active Slots: " + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "\n"
@@ -161,10 +190,11 @@ class MultiTokenBot:
 
         while self.is_running:
             try:
-                # 1. Fetch all 50 coin prices in a single API call
+                # 1. Fetch all 50 coin prices in a single unblocked API call
                 batch_prices = await asyncio.to_thread(fetch_all_binance_prices)
                 if not batch_prices:
-                    await asyncio.sleep(6)
+                    print("[Batch Scanner] No prices returned, retrying...")
+                    await asyncio.sleep(4)
                     continue
 
                 # 2. Check Circuit Breaker
@@ -218,15 +248,18 @@ class MultiTokenBot:
                             continue
 
                         history = self.price_history[symbol]
-                        if len(history) < 5:
+                        if len(history) < 2:
                             continue
 
                         # Calculate Trend, RSI, and Conviction Score
                         price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0
-                        momentum = 0.85 if history[-1] > history[-3] else 0.35
                         trend = "UP" if history[-1] >= history[0] else "DOWN"
+                        momentum = 0.85 if trend == "UP" else 0.35
                         spread = max(history) - min(history)
-                        rsi = 50.0 + ((history[-1] - min(history)) / (spread + 1e-9) - 0.5) * 30.0
+                        if spread > 0:
+                            rsi = 45.0 + ((history[-1] - min(history)) / spread - 0.5) * 20.0
+                        else:
+                            rsi = 48.0 if trend == "UP" else 52.0
 
                         signal = strategy_agent.evaluate_market(
                             trend=trend,
@@ -239,9 +272,8 @@ class MultiTokenBot:
                         )
 
                         if signal in ["LONG", "SHORT"]:
-                            # Score candidate based on momentum strength & RSI alignment
                             rsi_bonus = (70.0 - rsi) if signal == "LONG" else (rsi - 30.0)
-                            conviction_score = round((price_change_pct * 25.0) + max(0.0, rsi_bonus), 1)
+                            conviction_score = round((price_change_pct * 50.0) + max(10.0, rsi_bonus), 1)
                             candidates.append({
                                 "symbol": symbol,
                                 "signal": signal,
@@ -301,7 +333,7 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         send_telegram_alert(
             "🚀 *50-Coin Batch Scanner & Ranking Bot Online!*\n"
-            "• Scanned Universe: Top 50 Binance Liquid Pairs\n"
+            "• Scanned Universe: Top 50 Binance Vision Pairs\n"
             "• Execution Mode: Best 5 Setups (Ranked by Score)\n"
             "• Leverage: " + str(self.engine.leverage) + "x Isolated Margin\n"
             "• Max Concurrent Slots: " + str(self.engine.max_concurrent)
