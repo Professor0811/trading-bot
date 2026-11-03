@@ -1,7 +1,9 @@
 import asyncio
 import sqlite3
 import os
+import json
 import requests
+import websockets
 from datetime import datetime
 import config
 import risk_manager
@@ -13,7 +15,7 @@ DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Top 50 High-Liquidity Binance Futures/Spot Pairs with mapping
+# Top 50 High-Liquidity Binance Pairs mapping
 TOP_50_MAP = {
     "BTC/USDC": "BTCUSDT", "ETH/USDC": "ETHUSDT", "SOL/USDC": "SOLUSDT",
     "BNB/USDC": "BNBUSDT", "XRP/USDC": "XRPUSDT", "DOGE/USDC": "DOGEUSDT",
@@ -34,6 +36,9 @@ TOP_50_MAP = {
     "ORDI/USDC": "ORDIUSDT", "PENDLE/USDC": "PENDLEUSDT"
 }
 
+# Reverse lookup for websocket stream matching
+REVERSE_MAP = {v.lower(): k for k, v in TOP_50_MAP.items()}
+
 
 def fmt_p(val: float) -> str:
     if val is None:
@@ -44,45 +49,6 @@ def fmt_p(val: float) -> str:
     elif val < 1.0:
         return f"{val:.6f}"
     return f"{val:.4f}"
-
-
-def fetch_all_binance_prices() -> dict:
-    """Batch fetch all 50 coin prices via Binance Vision API."""
-    prices = {}
-    endpoints = [
-        "https://data-api.binance.vision/api/v3/ticker/price",
-        "https://api.binance.com/api/v3/ticker/price",
-        "https://api1.binance.com/api/v3/ticker/price"
-    ]
-
-    for url in endpoints:
-        try:
-            res = requests.get(url, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list):
-                    binance_lookup = {item["symbol"]: float(item["price"]) for item in data if "symbol" in item and "price" in item}
-                    for pair, b_sym in TOP_50_MAP.items():
-                        if b_sym in binance_lookup and binance_lookup[b_sym] > 0:
-                            prices[pair] = binance_lookup[b_sym]
-                    if len(prices) >= 10:
-                        return prices
-        except Exception:
-            continue
-
-    # Fallback to Bybit
-    try:
-        res = requests.get("https://api.bybit.com/v5/market/tickers?category=spot", timeout=5)
-        if res.status_code == 200:
-            items = res.json().get("result", {}).get("list", [])
-            bybit_lookup = {item["symbol"]: float(item["lastPrice"]) for item in items if "symbol" in item and "lastPrice" in item}
-            for pair, b_sym in TOP_50_MAP.items():
-                if b_sym in bybit_lookup and bybit_lookup[b_sym] > 0:
-                    prices[pair] = bybit_lookup[b_sym]
-    except Exception:
-        pass
-
-    return prices
 
 
 def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, pnl=0.0, status="OPEN"):
@@ -146,9 +112,9 @@ class MultiTokenBot:
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             status_reply = (
-                                "📊 *Klins-Engine Scanner Status (5 Slots):*\n"
+                                "📊 *WebSocket-Engine Status (5 Slots):*\n"
                                 "• Engine State: " + state_str + "\n"
-                                "• Coins Synced: " + str(len(self.latest_prices)) + "/50\n"
+                                "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
                                 "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
                                 "• Active Slots: " + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "\n"
@@ -158,12 +124,12 @@ class MultiTokenBot:
 
                         elif text == "/stop":
                             self.trading_enabled = False
-                            send_telegram_alert("🛑 *Trading Paused!* Scanner will not open new positions.")
+                            send_telegram_alert("🛑 *Trading Paused!* WebSocket stream active, but no new positions will be opened.")
 
                         elif text == "/start":
                             self.trading_enabled = True
                             self.circuit_breaker_alerted = False
-                            send_telegram_alert("▶️ *Trading Resumed!* Klines & EMA Ranking Engine active.")
+                            send_telegram_alert("▶️ *Trading Resumed!* Real-time WebSocket engine active.")
 
                         elif text == "/closeall":
                             closed_count = 0
@@ -180,127 +146,94 @@ class MultiTokenBot:
 
             await asyncio.sleep(2)
 
-    async def batch_scanner_loop(self):
-        print("[Klines Scanner] Monitoring Top 50 Coins with 15m OHLCV...")
+    async def process_tick(self, symbol: str, current_price: float):
+        """Process real-time price tick received from WebSocket stream."""
+        try:
+            self.latest_prices[symbol] = current_price
+            history = self.price_history[symbol]
+            history.append(current_price)
+            if len(history) > 20:
+                history.pop(0)
 
-        while self.is_running:
-            try:
-                # 1. Fetch live prices
-                batch_prices = await asyncio.to_thread(fetch_all_binance_prices)
-                if not batch_prices:
-                    await asyncio.sleep(4)
-                    continue
+            # 1. Check Circuit Breaker
+            if self.engine.is_circuit_breaker_triggered():
+                if not self.circuit_breaker_alerted:
+                    self.trading_enabled = False
+                    self.circuit_breaker_alerted = True
+                    send_telegram_alert("🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!")
 
-                # 2. Check Circuit Breaker
-                if self.engine.is_circuit_breaker_triggered():
-                    if not self.circuit_breaker_alerted:
-                        self.trading_enabled = False
-                        self.circuit_breaker_alerted = True
-                        send_telegram_alert("🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!")
+            # 2. Check Exits if position is open
+            if symbol in self.engine.positions:
+                closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
+                if closed:
+                    side_name = closed["side"]
+                    record_trade_db(
+                        token_symbol=symbol,
+                        action="CLOSE_" + side_name,
+                        amount=closed["margin"],
+                        entry_price=closed["entry_price"],
+                        exit_price=closed["exit_price"],
+                        pnl=closed["pnl"],
+                        status="CLOSED"
+                    )
 
-                # 3. Check exits for open positions
-                for symbol, current_price in batch_prices.items():
-                    self.latest_prices[symbol] = current_price
-                    history = self.price_history[symbol]
-                    history.append(current_price)
-                    if len(history) > 20:
-                        history.pop(0)
+                    alert_msg = (
+                        "🏁 *Futures Position Closed (Slot Freed!)*\n"
+                        "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
+                        "• Reason: `" + str(closed['reason']) + "`\n"
+                        "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n"
+                        "• Exit Price: `$" + fmt_p(closed['exit_price']) + "`\n"
+                        "• Net PnL: `$" + f"{closed['pnl']:+.2f}" + "`\n"
+                        "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
+                        "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`"
+                    )
+                    send_telegram_alert(alert_msg)
 
-                    if symbol in self.engine.positions:
-                        closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
-                        if closed:
-                            side_name = closed["side"]
-                            record_trade_db(
-                                token_symbol=symbol,
-                                action="CLOSE_" + side_name,
-                                amount=closed["margin"],
-                                entry_price=closed["entry_price"],
-                                exit_price=closed["exit_price"],
-                                pnl=closed["pnl"],
-                                status="CLOSED"
-                            )
+            # 3. Check Entries if slots are available
+            free_slots = self.engine.max_concurrent - len(self.engine.positions)
+            if self.trading_enabled and free_slots > 0 and self.engine.can_open_position(symbol):
+                if len(history) >= 2:
+                    price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0
+                    trend = "UP" if history[-1] >= history[0] else "DOWN"
+                    momentum = 0.85 if trend == "UP" else 0.35
 
-                            alert_msg = (
-                                "🏁 *Futures Position Closed (Slot Freed!)*\n"
-                                "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
-                                "• Reason: `" + str(closed['reason']) + "`\n"
-                                "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n"
-                                "• Exit Price: `$" + fmt_p(closed['exit_price']) + "`\n"
-                                "• Net PnL: `$" + f"{closed['pnl']:+.2f}" + "`\n"
-                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
-                                "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`"
-                            )
-                            send_telegram_alert(alert_msg)
+                    bin_sym = TOP_50_MAP.get(symbol, "BTCUSDT")
+                    signal = strategy_agent.evaluate_market(
+                        trend=trend,
+                        rsi=50.0,
+                        momentum=momentum,
+                        liquidity_usd=1000000.0,
+                        macd=1.2,
+                        macd_signal=0.6,
+                        price=current_price,
+                        binance_symbol=bin_sym
+                    )
 
-                # 4. Scan & Rank Candidates with Real Klines
-                free_slots = self.engine.max_concurrent - len(self.engine.positions)
-                if self.trading_enabled and free_slots > 0:
-                    candidates = []
-                    b_map = TOP_50_MAP
-
-                    for symbol, current_price in batch_prices.items():
-                        if not self.engine.can_open_position(symbol):
-                            continue
-
-                        history = self.price_history[symbol]
-                        price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0 if len(history) >= 2 else 0.5
-                        trend = "UP" if len(history) >= 2 and history[-1] >= history[0] else "DOWN"
-                        momentum = 0.85 if trend == "UP" else 0.35
-
-                        # Evaluate using Real Klines & Wilder's RSI via Strategy Agent
-                        bin_sym = b_map.get(symbol, "BTCUSDT")
-                        signal = strategy_agent.evaluate_market(
-                            trend=trend,
-                            rsi=50.0,
-                            momentum=momentum,
-                            liquidity_usd=1000000.0,
-                            macd=1.2,
-                            macd_signal=0.6,
-                            price=current_price,
-                            binance_symbol=bin_sym
-                        )
-
-                        if signal in ["LONG", "SHORT"]:
-                            conviction_score = round((price_change_pct * 40.0) + 50.0, 1)
-                            candidates.append({
-                                "symbol": symbol,
-                                "signal": signal,
-                                "price": current_price,
-                                "score": conviction_score
-                            })
-
-                    candidates.sort(key=lambda x: x["score"], reverse=True)
-                    top_picks = candidates[:free_slots]
-
-                    for pick in top_picks:
-                        sym = pick["symbol"]
-                        sig = pick["signal"]
-                        cur_p = pick["price"]
-                        score = pick["score"]
-
+                    if signal in ["LONG", "SHORT"]:
+                        conviction_score = round((price_change_pct * 40.0) + 50.0, 1)
                         margin_amount = self.engine.calculate_position_size()
-                        order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p)
+                        order_success = self.engine.execute_order(symbol, signal, margin_amount, current_price)
 
                         if order_success:
-                            pos = self.engine.positions.get(sym, {})
-                            entry_p = pos.get("entry_price", cur_p)
+                            pos = self.engine.positions.get(symbol, {})
+                            entry_p = pos.get("entry_price", current_price)
                             tp_p = pos.get("tp_price", entry_p)
                             sl_p = pos.get("sl_price", entry_p)
                             liq_p = pos.get("liq_price", entry_p)
                             leveraged_size = pos.get("leveraged_size", margin_amount * self.engine.leverage)
 
                             record_trade_db(
-                                token_symbol=sym,
-                                action=sig + "_" + str(self.engine.leverage) + "X",
+                                token_symbol=symbol,
+                                action=signal + "_" + str(self.engine.leverage) + "X",
                                 amount=margin_amount,
                                 entry_price=entry_p,
                                 status="OPEN"
                             )
 
-                            side_emoji = "🟢" if sig == "LONG" else "🔴"
+                            side_emoji = "🟢" if signal == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Klines-Engine " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
-                                "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
+                                side_emoji + " *WebSocket Real-Time " + str(self.engine.leverage) + "x Order (" + signal + ")*\n"
+                                "• Pair: `" + symbol + "` (Score: `" + str(conviction_score) + "`)\n"
                                 "• Leverage: `" + str(self.engine.leverage) + "x Isolated`\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
                                 "• Margin (2%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}`)\n"
@@ -308,24 +241,48 @@ class MultiTokenBot:
                                 "• Stop-Loss Target: `$" + fmt_p(sl_p) + "`\n"
                                 "• Est. Liq Price: `$" + fmt_p(liq_p) + "`\n"
                                 "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`\n"
-                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}`"
+                                "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
                             )
                             send_telegram_alert(alert_msg)
+        except Exception as e:
+            print(f"[Tick Processing Error for {symbol}]:", e)
 
-            except Exception as err:
-                print("[Klines Scanner Loop Error]:", err)
-
-            await asyncio.sleep(6)
+    async def websocket_stream_listener(self):
+        """Connect to Binance Vision WebSocket mini-ticker stream with auto-reconnection."""
+        uri = "wss://stream.binance.vision:443/ws/!miniTicker@arr"
+        
+        while self.is_running:
+            try:
+                print("[WebSocket] Connecting to Binance Live Stream...")
+                async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as websocket:
+                    print("[WebSocket] Connected successfully!")
+                    send_telegram_alert("🔌 *WebSocket Stream Connected!* Real-time market feed active.")
+                    
+                    async for message in websocket:
+                        if not self.is_running:
+                            break
+                        data = json.loads(message)
+                        if isinstance(data, list):
+                            for item in data:
+                                b_sym = item.get("s", "").lower()
+                                price_str = item.get("c")
+                                if b_sym in REVERSE_MAP and price_str:
+                                    symbol = REVERSE_MAP[b_sym]
+                                    current_price = float(price_str)
+                                    await self.process_tick(symbol, current_price)
+            except Exception as e:
+                print(f"[WebSocket Disconnected / Error]: {e}. Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
 
     async def run_parallel_trading(self):
         send_telegram_alert(
-            "🚀 *Klines Indicator Bot Online!*\n"
-            "• Engine: Real 15m OHLCV Klines + Wilder's RSI + EMA\n"
-            "• Universe: Top 50 Binance Vision Pairs\n"
+            "🚀 *WebSocket-Integrated Bot Online!*\n"
+            "• Engine: Real-Time Binance WSS Mini-Tickers\n"
+            "• Indicator Core: 15m Klines + Wilder's RSI + EMA\n"
             "• Max Concurrent Slots: " + str(self.engine.max_concurrent)
         )
         await asyncio.gather(
-            self.batch_scanner_loop(),
+            self.websocket_stream_listener(),
             self.telegram_command_listener()
         )
 
