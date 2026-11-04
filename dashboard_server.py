@@ -1,5 +1,7 @@
 import os
+import asyncio
 import sqlite3
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -8,7 +10,46 @@ from multi_token_bot import MultiTokenBot
 
 DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 
-app = FastAPI(title="10x Autonomous Futures Dashboard")
+# Create a global bot instance so both background loop and API can read live state
+bot_instance = MultiTokenBot()
+
+
+def init_db():
+    """Ensure SQLite trades table exists on startup."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                token_symbol TEXT,
+                action TEXT,
+                amount REAL,
+                entry_price REAL,
+                exit_price REAL,
+                pnl REAL,
+                status TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("[DB Init Error]:", e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Automatically launches the MultiTokenBot in the background when FastAPI starts."""
+    init_db()
+    print("[Dashboard Server] Launching MultiTokenBot background engine...")
+    bot_task = asyncio.create_task(bot_instance.run_parallel_trading())
+    yield
+    bot_instance.is_running = False
+    bot_task.cancel()
+
+
+app = FastAPI(title="10x Autonomous Futures Dashboard", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,27 +69,17 @@ async def health_check():
 @app.get("/api/metrics")
 async def get_metrics():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT SUM(pnl) FROM trades WHERE status = 'CLOSED'")
-        row = cursor.fetchone()
-        realized_pnl = float(row[0]) if row and row[0] is not None else 0.0
-
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
-        open_count = cursor.fetchone()[0]
-        conn.close()
-
         starting_capital = getattr(config, "STARTING_CAPITAL", 1000.0)
-        margin_per_slot = starting_capital * getattr(config, "POSITION_MARGIN_PERCENT", 0.02)
-        locked_margin = open_count * margin_per_slot
-        current_equity = starting_capital + realized_pnl
-        available_cash = max(0.0, current_equity - locked_margin)
+        realized_pnl = round(bot_instance.engine.realized_pnl, 2)
+        available_cash = round(bot_instance.engine.cash_balance, 2)
+        total_equity = round(bot_instance.engine.get_total_equity(), 2)
+        open_count = len(bot_instance.engine.positions)
 
         return {
             "starting_capital": starting_capital,
-            "total_equity": round(current_equity, 2),
-            "available_cash": round(available_cash, 2),
-            "realized_pnl": round(realized_pnl, 2),
+            "total_equity": total_equity,
+            "available_cash": available_cash,
+            "realized_pnl": realized_pnl,
             "active_positions_count": open_count,
             "leverage": getattr(config, "LEVERAGE", 10),
             "max_concurrent": getattr(config, "MAX_CONCURRENT_TRADES", 5)
