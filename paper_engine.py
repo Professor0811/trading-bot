@@ -12,10 +12,23 @@ class PaperTradingEngine:
         self.positions = {}
         self.daily_starting_capital = initial_capital
 
-    def calculate_position_size(self) -> float:
-        """2% isolated margin per trade."""
+    def calculate_position_size(self, score: float = 80.0) -> float:
+        """
+        Dynamic Position Sizing based on setup conviction score:
+        - Score >= 90: High Conviction (2.5% margin)
+        - Score >= 75: Standard Conviction (2.0% margin)
+        - Score < 75:  Baseline / Speculative (1.5% margin)
+        """
         total_equity = self.get_total_equity()
-        margin = total_equity * config.POSITION_MARGIN_PERCENT
+
+        if score >= 90.0:
+            margin_pct = 0.025
+        elif score >= 75.0:
+            margin_pct = getattr(config, "POSITION_MARGIN_PERCENT", 0.02)
+        else:
+            margin_pct = 0.015
+
+        margin = total_equity * margin_pct
         return min(margin, self.cash_balance)
 
     def can_open_position(self, symbol: str, side: str = None) -> bool:
@@ -23,10 +36,9 @@ class PaperTradingEngine:
             return False
         if len(self.positions) >= self.max_concurrent:
             return False
-        if self.cash_balance < (self.get_total_equity() * config.POSITION_MARGIN_PERCENT * 0.8):
+        if self.cash_balance < (self.get_total_equity() * 0.012):
             return False
 
-        # Directional Exposure Cap: Limit concurrent positions on the same side
         if side:
             current_side_count = sum(1 for p in self.positions.values() if p.get("side") == side)
             if current_side_count >= self.max_same_side:
@@ -34,7 +46,7 @@ class PaperTradingEngine:
 
         return True
 
-    def execute_order(self, symbol: str, side: str, margin: float, entry_price: float, custom_atr: float = None) -> bool:
+    def execute_order(self, symbol: str, side: str, margin: float, entry_price: float, custom_atr: float = None, score: float = 80.0) -> bool:
         if not self.can_open_position(symbol, side=side) or margin <= 0 or entry_price <= 0:
             return False
 
@@ -42,7 +54,6 @@ class PaperTradingEngine:
         fee = leveraged_size * config.FUTURES_TAKER_FEE
         self.cash_balance -= (margin + fee)
 
-        # Dynamic ATR Targets: Partial TP = 1.5x ATR, Full TP = 3.0x ATR, SL = 1.5x ATR
         if custom_atr and custom_atr > 0:
             sl_dist = custom_atr * 1.5
             partial_tp_dist = custom_atr * 1.5
@@ -77,7 +88,8 @@ class PaperTradingEngine:
             "peak_price": entry_price,
             "trailing_active": False,
             "partial_tp_done": False,
-            "atr_used": custom_atr or (entry_price * 0.01)
+            "atr_used": custom_atr or (entry_price * 0.01),
+            "score": score
         }
         return True
 
