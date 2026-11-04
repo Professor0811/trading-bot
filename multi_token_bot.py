@@ -100,31 +100,58 @@ class MultiTokenBot:
                 history.pop(0)
 
         if symbol in self.engine.positions:
-            closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
-            if closed:
-                side_name = closed["side"]
-                await asyncio.to_thread(
-                    record_trade_db,
-                    symbol,
-                    "CLOSE_" + side_name,
-                    closed["margin"],
-                    closed["entry_price"],
-                    closed["exit_price"],
-                    closed["pnl"],
-                    "CLOSED"
-                )
+            event = self.engine.check_exit_conditions_for_token(symbol, current_price)
+            if event:
+                side_name = event["side"]
+                event_type = event.get("event_type", "FULL")
 
-                alert_msg = (
-                    "🏁 *Real-Time Exit (Slot Freed!)*\n"
-                    "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
-                    "• Reason: `" + str(closed['reason']) + "`\n"
-                    "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n"
-                    "• Exit Price: `$" + fmt_p(closed['exit_price']) + "`\n"
-                    "• Net PnL: `$" + f"{closed['pnl']:+.2f}" + "`\n"
-                    "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
-                    "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`"
-                )
-                await asyncio.to_thread(send_telegram_alert, alert_msg)
+                if event_type == "PARTIAL":
+                    await asyncio.to_thread(
+                        record_trade_db,
+                        symbol,
+                        "PARTIAL_50%_" + side_name,
+                        event["closed_margin"],
+                        event["entry_price"],
+                        event["exit_price"],
+                        event["pnl"],
+                        "CLOSED"
+                    )
+
+                    alert_msg = (
+                        "💰 *50% Partial Take-Profit + Auto Break-Even!*\n"
+                        "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
+                        "• Milestone: `+1.5x ATR Reached` 🎯\n"
+                        "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
+                        "• Scale-Out Price: `$" + fmt_p(event['exit_price']) + "`\n"
+                        "• Locked Profit (50%): `$" + f"{event['pnl']:+.2f}" + "`\n"
+                        "• New Stop-Loss: `$" + fmt_p(event['new_sl_price']) + " (Break-Even 🛡️)`\n"
+                        "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
+                    )
+                    await asyncio.to_thread(send_telegram_alert, alert_msg)
+
+                else:
+                    await asyncio.to_thread(
+                        record_trade_db,
+                        symbol,
+                        "CLOSE_" + side_name,
+                        event["margin"],
+                        event["entry_price"],
+                        event["exit_price"],
+                        event["pnl"],
+                        "CLOSED"
+                    )
+
+                    alert_msg = (
+                        "🏁 *Real-Time Exit (Slot Freed!)*\n"
+                        "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
+                        "• Reason: `" + str(event['reason']) + "`\n"
+                        "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
+                        "• Exit Price: `$" + fmt_p(event['exit_price']) + "`\n"
+                        "• Net PnL: `$" + f"{event['pnl']:+.2f}" + "`\n"
+                        "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`\n"
+                        "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`"
+                    )
+                    await asyncio.to_thread(send_telegram_alert, alert_msg)
 
     async def websocket_stream_listener(self):
         endpoints = [
@@ -195,7 +222,6 @@ class MultiTokenBot:
 
                     pre_candidates.sort(key=lambda x: x["change_pct"], reverse=True)
 
-                    # Evaluate top movers using 15m Klines + 1H Macro Trend + Volume Spike + Dynamic ATR
                     verified_picks = []
                     for cand in pre_candidates[:20]:
                         sym = cand["symbol"]
@@ -240,6 +266,7 @@ class MultiTokenBot:
                         if order_success:
                             pos = self.engine.positions.get(sym, {})
                             entry_p = pos.get("entry_price", cur_p)
+                            partial_p = pos.get("partial_tp_price", entry_p)
                             tp_p = pos.get("tp_price", entry_p)
                             sl_p = pos.get("sl_price", entry_p)
                             liq_p = pos.get("liq_price", entry_p)
@@ -257,14 +284,14 @@ class MultiTokenBot:
 
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *MTF + Volume " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Scale-Out " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
                                 "• Macro Alignment: `" + m_trend + " + 15m " + sig + "` 🧭\n"
                                 "• Volume Spike: `" + f"{v_ratio:.2f}x" + " Avg Vol` 🔥\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
+                                "• 50% Partial TP (1.5x ATR): `$" + fmt_p(partial_p) + "` 🎯\n"
+                                "• Full TP (3.0x ATR): `$" + fmt_p(tp_p) + "`\n"
                                 "• Dynamic SL (1.5x ATR): `$" + fmt_p(sl_p) + "`\n"
-                                "• Dynamic TP (3.0x ATR): `$" + fmt_p(tp_p) + "`\n"
-                                "• Est. Liq Price: `$" + fmt_p(liq_p) + "`\n"
                                 "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`\n"
                                 "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
                             )
@@ -304,15 +331,16 @@ class MultiTokenBot:
                                 tp_str = fmt_p(p["tp_price"])
                                 sl_str = fmt_p(p["sl_price"])
                                 side_str = p["side"]
+                                be_tag = " [BE🛡️]" if p.get("partial_tp_done") else ""
                                 margin_str = f"{p['margin']:.2f}"
-                                line = "• " + sym + " (" + side_str + " " + str(self.engine.leverage) + "x): Margin $" + margin_str + " | Entry $" + entry_str + " | SL $" + sl_str + " | TP $" + tp_str
+                                line = "• " + sym + " (" + side_str + be_tag + "): $" + margin_str + " | Ent $" + entry_str + " | SL $" + sl_str + " | TP $" + tp_str
                                 active_desc.append(line)
                             pos_text = "\n".join(active_desc) if active_desc else "None (0/5 Active Slots)"
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
                             status_reply = (
-                                "📊 *MTF + Volume ATR Bot Status:*\n"
+                                "📊 *Scale-Out & Break-Even Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Stream Feed: " + ws_str + "\n"
                                 "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
@@ -327,7 +355,7 @@ class MultiTokenBot:
                             self.trading_enabled = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "🛑 *Trading Paused!* Exits remain active, no new entries."
+                                "🛑 *Trading Paused!* Exits & Break-Even remain active."
                             )
 
                         elif text == "/start":
@@ -335,17 +363,16 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* MTF + Volume Engine active."
+                                "▶️ *Trading Resumed!* Scale-Out Engine active."
                             )
 
                         elif text == "/closeall":
                             closed_count = 0
                             for sym in list(self.engine.positions.keys()):
                                 cur_p = self.latest_prices.get(sym, self.engine.positions[sym]["entry_price"])
-                                closed = self.engine.check_exit_conditions_for_token(sym, cur_p)
-                                if not closed:
-                                    closed = self.engine._close_token_position(sym, "Manual /closeall", cur_p)
-                                closed_count += 1
+                                closed = self.engine._close_token_position(sym, "Manual /closeall", cur_p)
+                                if closed:
+                                    closed_count += 1
                             await asyncio.to_thread(
                                 send_telegram_alert,
                                 "⚠️ *Manual Exit Triggered!* Closed " + str(closed_count) + " position(s)."
@@ -359,10 +386,10 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Upgrade 2 Complete: Multi-Timeframe (1H + 15m) Engine Online!*\n"
-            "• Macro Filter: 1H EMA 20/50 Trend Alignment\n"
-            "• Micro Filter: 15m Wilder's RSI + Volume Spike (>=1.10x)\n"
-            "• Risk: Dynamic ATR (1.5x SL / 3.0x TP)"
+            "🚀 *Upgrade 3 Complete: Auto Break-Even & 50% Partial TP Online!*\n"
+            "• Scale-Out: Locks 50% profit at +1.5x ATR 🎯\n"
+            "• Protection: Moves SL to Entry (Break-Even 🛡️)\n"
+            "• Runner: Remaining 50% rides to +3.0x ATR + Trailing"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
