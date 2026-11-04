@@ -6,3 +6,4 @@ solana
 solders
 numpy
 pydantic
+psycopg2-binary
