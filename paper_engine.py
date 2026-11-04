@@ -1,3 +1,4 @@
+import time
 import config
 
 
@@ -7,18 +8,13 @@ class PaperTradingEngine:
         self.cash_balance = initial_capital
         self.realized_pnl = 0.0
         self.max_concurrent = max_concurrent
-        self.max_same_side = max_same_side  # Maximum 3 LONGs or 3 SHORTs concurrently
+        self.max_same_side = max_same_side
         self.leverage = getattr(config, "LEVERAGE", 10)
         self.positions = {}
         self.daily_starting_capital = initial_capital
+        self.zombie_timeout_sec = 3 * 3600  # 3 Hours Stagnant Limit
 
     def calculate_position_size(self, score: float = 80.0) -> float:
-        """
-        Dynamic Position Sizing based on setup conviction score:
-        - Score >= 90: High Conviction (2.5% margin)
-        - Score >= 75: Standard Conviction (2.0% margin)
-        - Score < 75:  Baseline / Speculative (1.5% margin)
-        """
         total_equity = self.get_total_equity()
 
         if score >= 90.0:
@@ -89,7 +85,8 @@ class PaperTradingEngine:
             "trailing_active": False,
             "partial_tp_done": False,
             "atr_used": custom_atr or (entry_price * 0.01),
-            "score": score
+            "score": score,
+            "opened_at": time.time()  # Track opening timestamp for Zombie Killer
         }
         return True
 
@@ -105,6 +102,7 @@ class PaperTradingEngine:
         sl = pos["sl_price"]
         liq = pos["liq_price"]
         trail_pct = config.TRAILING_STOP_PERCENT
+        opened_at = pos.get("opened_at", time.time())
 
         # 1. Liquidation Check
         if (side == "LONG" and current_price <= liq) or (side == "SHORT" and current_price >= liq):
@@ -115,12 +113,25 @@ class PaperTradingEngine:
             reason_label = "Break-Even Stop (Risk-Free)" if pos.get("partial_tp_done") else "Dynamic ATR Stop-Loss"
             return self._close_token_position(symbol, reason_label, current_price)
 
-        # 3. Auto Break-Even & 50% Partial Take-Profit at +1.5x ATR
+        # 3. Time-Based Stagnant Trade Killer (Zombie Trade Exit)
+        # If open > 3 hours and stuck within -0.35% to +0.35% range without partial TP
+        elapsed_sec = time.time() - opened_at
+        if elapsed_sec >= self.zombie_timeout_sec and not pos.get("partial_tp_done", False):
+            price_delta_pct = abs((current_price - entry) / entry) * 100.0
+            if price_delta_pct <= 0.35:
+                elapsed_hrs = round(elapsed_sec / 3600.0, 1)
+                return self._close_token_position(
+                    symbol,
+                    f"Zombie Trade Killer ({elapsed_hrs}h Stagnant)",
+                    current_price
+                )
+
+        # 4. Auto Break-Even & 50% Partial Take-Profit at +1.5x ATR
         if not pos.get("partial_tp_done", False):
             if (side == "LONG" and current_price >= partial_tp) or (side == "SHORT" and current_price <= partial_tp):
                 return self._scale_out_half_position(symbol, current_price)
 
-        # 4. Full Take-Profit (3.0x ATR) & Trailing Stop Activation
+        # 5. Full Take-Profit (3.0x ATR) & Trailing Stop Activation
         if side == "LONG":
             if current_price >= tp:
                 pos["trailing_active"] = True
