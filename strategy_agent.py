@@ -72,7 +72,7 @@ def calculate_volume_ratio(volumes, period=20):
     if not volumes or len(volumes) < period + 2:
         return 1.2
 
-     baseline_vols = volumes[-(period + 2):-2]
+    baseline_vols = volumes[-(period + 2):-2]
     avg_vol = float(np.mean(baseline_vols)) if baseline_vols else 1.0
     if avg_vol <= 0:
         return 1.2
@@ -144,10 +144,8 @@ def evaluate_market_with_atr(trend: str, price: float, binance_symbol: str = Non
             atr_val = calculate_atr(highs, lows, closes, period=14)
             vol_ratio = calculate_volume_ratio(volumes, period=20)
 
-            # Cap ATR between 0.6% and 2.5% of price
             atr_val = max(price * 0.006, min(atr_val, price * 0.025))
 
-            # Fakeout Protection: Reject setups with dead volume (< 1.10x average volume)
             if vol_ratio < 1.10:
                 return "HOLD", atr_val, vol_ratio
 
