@@ -20,13 +20,28 @@ class BybitConnector:
         self.tickers_cache = {}
         self.ws = None
         self.ws_thread = None
+        self.ping_thread = None
+        self.is_connected = False
 
-        # Start Bybit V5 Public WebSocket in Background
         self.start_websocket()
+
+    def send_heartbeat(self):
+        """Bybit V5 requires a ping every 20 seconds to keep connection alive."""
+        while True:
+            time.sleep(20)
+            if self.ws and self.is_connected:
+                try:
+                    self.ws.send(json.dumps({"op": "ping"}))
+                except Exception:
+                    pass
 
     def on_message(self, ws, message):
         try:
             data = json.loads(message)
+            # Ignore pong responses
+            if data.get("op") == "pong" or data.get("ret_msg") == "pong":
+                return
+
             topic = data.get("topic", "")
             if topic.startswith("tickers."):
                 tick_data = data.get("data", {})
@@ -53,13 +68,14 @@ class BybitConnector:
         print("[Bybit WS Error]:", error)
 
     def on_close(self, ws, close_status_code, close_msg):
+        self.is_connected = False
         print("[Bybit WS Closed]. Reconnecting in 3 seconds...")
         time.sleep(3)
         self.start_websocket()
 
     def on_open(self, ws):
-        print("[Bybit WS] Connected to Bybit V5 Public Linear Stream ⚡")
-        # Subscribe to Linear USDT perpetual tickers
+        self.is_connected = True
+        print("[Bybit WS] Connected & Stream Authenticated ⚡")
         sub_msg = {
             "op": "subscribe",
             "args": [
@@ -85,6 +101,10 @@ class BybitConnector:
         )
         self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
         self.ws_thread.start()
+
+        if not self.ping_thread:
+            self.ping_thread = threading.Thread(target=self.send_heartbeat, daemon=True)
+            self.ping_thread.start()
 
     def fetch_all_linear_tickers(self) -> list:
         if self.tickers_cache:
