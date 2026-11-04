@@ -1,11 +1,8 @@
 import asyncio
 import os
-import json
 import requests
-import websockets
 from datetime import datetime
 import config
-import risk_manager
 import strategy_agent
 import database
 from bybit_connector import bybit_client
@@ -37,7 +34,6 @@ class MultiTokenBot:
         self.is_running = True
         self.trading_enabled = True
         self.circuit_breaker_alerted = False
-        self.ws_connected = False
         self.latest_prices = {}
         self.price_history = {}
         self.market_radar = []
@@ -74,7 +70,7 @@ class MultiTokenBot:
 
                     alert_msg = (
                         "💰 *50% Partial Take-Profit + Auto Break-Even!*\n"
-                        "• Exchange: `Bybit V5 Linear` ⚡\n"
+                        "• Exchange: `Bybit V5 Linear (Hybrid)` ⚡\n"
                         "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                         "• Milestone: `+1.5x ATR Reached` 🎯\n"
                         "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
@@ -102,7 +98,7 @@ class MultiTokenBot:
 
                     alert_msg = (
                         header_icon + "\n"
-                        "• Exchange: `Bybit V5 Linear` ⚡\n"
+                        "• Exchange: `Bybit V5 Linear (Hybrid)` ⚡\n"
                         "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                         "• Reason: `" + str(event['reason']) + "`\n"
                         "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
@@ -114,32 +110,18 @@ class MultiTokenBot:
                     await asyncio.to_thread(send_telegram_alert, alert_msg)
 
     async def bybit_scanner_and_trading_loop(self):
-        """
-        Institutional 2-Stage Market Scanner across all 300+ Bybit Perpetuals
-        """
         while self.is_running:
             try:
-                # 1. Update BTC Market Regime Filter
+                # 1. Bitcoin Market Regime පරීක්ෂාව
                 regime_data = await asyncio.to_thread(strategy_agent.check_btc_market_regime)
                 self.btc_regime = regime_data
 
-                now_ts = asyncio.get_event_loop().time()
-                if regime_data.get("regime") in ["CRASH", "BEAR"] and not regime_data.get("allow_long"):
-                    if (now_ts - self.last_crash_alert_time) > 600:
-                        self.last_crash_alert_time = now_ts
-                        await asyncio.to_thread(
-                            send_telegram_alert,
-                            f"🚨 *BYBIT BTC CRASH DETECTOR TRIGGERED!*\n"
-                            f"• State: `{regime_data['regime']}` 📉\n"
-                            f"• Reason: `{regime_data['reason']}`\n"
-                            f"• Altcoin Longs: `LOCKED ⛔`\n"
-                            f"• Altcoin Shorts: `ACTIVE ✅`"
-                        )
-
-                # 2. Stage 1: Fetch all 300+ Linear Tickers from Bybit
+                # 2. කාසි 300+ සඳහා Tickers ලබා ගැනීම
                 all_tickers = await asyncio.to_thread(bybit_client.fetch_all_linear_tickers)
                 valid_candidates = []
                 radar_items = []
+
+                min_turnover = getattr(config, "MIN_24H_TURNOVER_USDT", 1000000.0)
 
                 for item in all_tickers:
                     sym = item.get("symbol", "")
@@ -153,11 +135,16 @@ class MultiTokenBot:
                     if last_price <= 0:
                         continue
 
-                    # Update in-memory live price
                     await self.handle_fast_tick(sym, last_price)
 
-                    # Filter for liquid coins ($5M+ 24h volume)
-                    if turnover_24h >= config.MIN_24H_TURNOVER_USDT:
+                    radar_items.append({
+                        "symbol": sym,
+                        "price": last_price,
+                        "change_pct": round(change_24h_pct, 2),
+                        "turnover": turnover_24h
+                    })
+
+                    if turnover_24h >= min_turnover:
                         valid_candidates.append({
                             "symbol": sym,
                             "price": last_price,
@@ -165,16 +152,12 @@ class MultiTokenBot:
                             "change_pct": change_24h_pct,
                             "trend": "UP" if change_24h_pct >= 0 else "DOWN"
                         })
-                        radar_items.append({
-                            "symbol": sym,
-                            "price": last_price,
-                            "change_pct": round(change_24h_pct, 2)
-                        })
 
-                radar_items.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
-                self.market_radar = radar_items[:15]
+                if radar_items:
+                    radar_items.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+                    self.market_radar = radar_items[:15]
 
-                # Check Circuit Breaker
+                # Circuit Breaker පරීක්ෂාව
                 if self.engine.is_circuit_breaker_triggered():
                     if not self.circuit_breaker_alerted:
                         self.trading_enabled = False
@@ -184,11 +167,11 @@ class MultiTokenBot:
                             "🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!"
                         )
 
-                # 3. Stage 2: Deep Scan for Entry Setup on Top Movers
+                # 3. Stage 2: ප්‍රශස්ත Momentum කාසි සඳහා ගැඹුරු විශ්ලේෂණය
                 free_slots = self.engine.max_concurrent - len(self.engine.positions)
                 if self.trading_enabled and free_slots > 0 and valid_candidates:
                     valid_candidates.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
-                    top_pool = valid_candidates[:25]  # Deep scan top 25 momentum movers
+                    top_pool = valid_candidates[:25]
 
                     verified_picks = []
                     for cand in top_pool:
@@ -263,7 +246,7 @@ class MultiTokenBot:
                             conviction_badge = "🔥 High (2.5%)" if score >= 90 else ("⚡ Standard (2.0%)" if score >= 75 else "⚠️ Baseline (1.5%)")
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Bybit V5 300+ Scanner: " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Bybit Hybrid 300+ Scanner: " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
                                 "• BTC Regime: `" + self.btc_regime.get("regime", "STABLE") + " 🛡️`\n"
                                 "• Conviction: `" + conviction_badge + "`\n"
@@ -280,9 +263,9 @@ class MultiTokenBot:
                             await asyncio.to_thread(send_telegram_alert, alert_msg)
 
             except Exception as e:
-                print("[Bybit Scanner Error]:", e)
+                print("[Bybit Scanner Loop Error]:", e)
 
-            await asyncio.sleep(4)
+            await asyncio.sleep(3)
 
     async def telegram_command_listener(self):
         if not BOT_TOKEN:
@@ -328,13 +311,13 @@ class MultiTokenBot:
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             regime_icon = "🟢" if self.btc_regime.get("regime") == "STABLE" else "🚨"
                             status_reply = (
-                                "📊 *Chama Capital Management - Bybit Terminal Status:*\n"
+                                "📊 *Chama Capital Management - Status:*\n"
                                 "• Engine State: " + state_str + "\n"
-                                "• Exchange Feed: `Bybit V5 Linear (300+ Pairs)` ⚡\n"
+                                "• Exchange Feed: `Bybit Hybrid (300+ Pairs)` ⚡\n"
                                 "• Database: `" + ("Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite") + "` 🗄️\n"
                                 "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + "`\n"
                                 "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
-                                "• Live Tracked Coins: " + str(len(self.latest_prices)) + " Bybit Perpetual Pairs\n"
+                                "• Tracked Pairs: " + str(len(self.latest_prices)) + " Live Pairs\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
                                 "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
                                 "• Active Slots: " + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "\n"
@@ -344,18 +327,12 @@ class MultiTokenBot:
 
                         elif text == "/stop":
                             self.trading_enabled = False
-                            await asyncio.to_thread(
-                                send_telegram_alert,
-                                "🛑 *Trading Paused!* Exits & Break-Even remain active."
-                            )
+                            await asyncio.to_thread(send_telegram_alert, "🛑 *Trading Paused!* Exits & Break-Even active.")
 
                         elif text == "/start":
                             self.trading_enabled = True
                             self.circuit_breaker_alerted = False
-                            await asyncio.to_thread(
-                                send_telegram_alert,
-                                "▶️ *Trading Resumed!* Bybit 300+ Quant Engine active."
-                            )
+                            await asyncio.to_thread(send_telegram_alert, "▶️ *Trading Resumed!* Scanner active.")
 
                         elif text == "/closeall":
                             closed_count = 0
@@ -364,10 +341,7 @@ class MultiTokenBot:
                                 closed = self.engine._close_token_position(sym, "Manual /closeall", cur_p)
                                 if closed:
                                     closed_count += 1
-                            await asyncio.to_thread(
-                                send_telegram_alert,
-                                "⚠️ *Manual Exit Triggered!* Closed " + str(closed_count) + " position(s)."
-                            )
+                            await asyncio.to_thread(send_telegram_alert, f"⚠️ *Manual Exit Triggered!* Closed {closed_count} position(s).")
 
             except Exception as e:
                 print("[Telegram Listener Error]:", e)
@@ -378,9 +352,9 @@ class MultiTokenBot:
         db_type = "Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite"
         await asyncio.to_thread(
             send_telegram_alert,
-            f"🚀 *Bybit V5 Quant Engine Online (All 300+ Pairs Scanner)!* ⚡\n"
-            f"• Exchange: `Bybit V5 Linear Perpetuals`\n"
-            f"• Scanner: `300+ Pairs 2-Stage Filter ($5M+ Vol)` 🌐\n"
+            f"🚀 *Bybit V5 Quant Engine Online (Hybrid Failover Activated)!* ⚡\n"
+            f"• Market Feed: `Zero-Drop Multi-Stream Feed` 🌐\n"
+            f"• Scanner: `300+ Pairs 2-Stage Filter ($1M+ Vol)`\n"
             f"• Persistence: `{db_type}` 🗄️\n"
             f"• BTC Crash Guard & Zombie Killer: Fully Armed 🛡️🧟"
         )
