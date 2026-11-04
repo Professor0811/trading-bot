@@ -82,7 +82,8 @@ class MultiTokenBot:
     def __init__(self):
         self.engine = PaperTradingEngine(
             initial_capital=config.STARTING_CAPITAL,
-            max_concurrent=5
+            max_concurrent=5,
+            max_same_side=3  # Institutional exposure cap: max 3 LONGs and 3 SHORTs
         )
         self.is_running = True
         self.trading_enabled = True
@@ -205,7 +206,7 @@ class MultiTokenBot:
                 if self.trading_enabled and free_slots > 0 and len(self.latest_prices) > 0:
                     pre_candidates = []
                     for symbol, current_price in list(self.latest_prices.items()):
-                        if not self.engine.can_open_position(symbol):
+                        if symbol in self.engine.positions:
                             continue
                         history = self.price_history.get(symbol, [])
                         if len(history) < 2:
@@ -246,12 +247,14 @@ class MultiTokenBot:
                                 "vol_ratio": vol_ratio,
                                 "macro_trend": macro_trend
                             })
-                            if len(verified_picks) >= free_slots:
-                                break
 
                     verified_picks.sort(key=lambda x: x["score"], reverse=True)
 
-                    for pick in verified_picks[:free_slots]:
+                    # Execute trades respecting both Max Concurrent Slots (5) and Directional Cap (Max 3 per side)
+                    for pick in verified_picks:
+                        if len(self.engine.positions) >= self.engine.max_concurrent:
+                            break
+
                         sym = pick["symbol"]
                         sig = pick["signal"]
                         cur_p = pick["price"]
@@ -259,6 +262,9 @@ class MultiTokenBot:
                         atr = pick["atr"]
                         v_ratio = pick["vol_ratio"]
                         m_trend = pick["macro_trend"]
+
+                        if not self.engine.can_open_position(sym, side=sig):
+                            continue
 
                         margin_amount = self.engine.calculate_position_size()
                         order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p, custom_atr=atr)
@@ -282,15 +288,18 @@ class MultiTokenBot:
                                 "OPEN"
                             )
 
+                            long_count = sum(1 for p in self.engine.positions.values() if p["side"] == "LONG")
+                            short_count = sum(1 for p in self.engine.positions.values() if p["side"] == "SHORT")
+
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Scale-Out " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Hedged Quant " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
+                                "• Exposure Balance: `" + str(long_count) + "L / " + str(short_count) + "S (Cap: 3)` ⚖️\n"
                                 "• Macro Alignment: `" + m_trend + " + 15m " + sig + "` 🧭\n"
                                 "• Volume Spike: `" + f"{v_ratio:.2f}x" + " Avg Vol` 🔥\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
                                 "• 50% Partial TP (1.5x ATR): `$" + fmt_p(partial_p) + "` 🎯\n"
-                                "• Full TP (3.0x ATR): `$" + fmt_p(tp_p) + "`\n"
                                 "• Dynamic SL (1.5x ATR): `$" + fmt_p(sl_p) + "`\n"
                                 "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`\n"
                                 "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
@@ -326,11 +335,17 @@ class MultiTokenBot:
 
                         if text == "/status":
                             active_desc = []
+                            long_c = 0
+                            short_c = 0
                             for sym, p in self.engine.positions.items():
                                 entry_str = fmt_p(p["entry_price"])
                                 tp_str = fmt_p(p["tp_price"])
                                 sl_str = fmt_p(p["sl_price"])
                                 side_str = p["side"]
+                                if side_str == "LONG":
+                                    long_c += 1
+                                else:
+                                    short_c += 1
                                 be_tag = " [BE🛡️]" if p.get("partial_tp_done") else ""
                                 margin_str = f"{p['margin']:.2f}"
                                 line = "• " + sym + " (" + side_str + be_tag + "): $" + margin_str + " | Ent $" + entry_str + " | SL $" + sl_str + " | TP $" + tp_str
@@ -340,9 +355,10 @@ class MultiTokenBot:
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
                             status_reply = (
-                                "📊 *Scale-Out & Break-Even Bot Status:*\n"
+                                "📊 *Institutional Futures Quant Status:*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Stream Feed: " + ws_str + "\n"
+                                "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
                                 "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
                                 "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
@@ -363,7 +379,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* Scale-Out Engine active."
+                                "▶️ *Trading Resumed!* Institutional Quant Engine active."
                             )
 
                         elif text == "/closeall":
@@ -386,10 +402,12 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Upgrade 3 Complete: Auto Break-Even & 50% Partial TP Online!*\n"
-            "• Scale-Out: Locks 50% profit at +1.5x ATR 🎯\n"
-            "• Protection: Moves SL to Entry (Break-Even 🛡️)\n"
-            "• Runner: Remaining 50% rides to +3.0x ATR + Trailing"
+            "🚀 *Upgrade 4 Complete: Institutional Quant Engine Fully Armed!*\n"
+            "• Exposure Cap: Max 3 LONGs / Max 3 SHORTs (Anti-Correlation Hedge) ⚖️\n"
+            "• Scale-Out: 50% Profit Lock at +1.5x ATR + Auto Break-Even 🛡️\n"
+            "• Multi-Timeframe: 1H Macro + 15m Micro Alignment 🧭\n"
+            "• Volume Spike: >=1.10x 20-SMA Filter 🔥\n"
+            "• Tick Stream: Binance Vision Real-Time WSS"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
