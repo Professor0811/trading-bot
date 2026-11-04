@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     bot_task.cancel()
 
 
-app = FastAPI(title="10x Autonomous Futures Dashboard", lifespan=lifespan)
+app = FastAPI(title="Institutional Quant Terminal", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -195,150 +195,210 @@ async def control_bot(payload: dict = Body(...)):
     return {"error": "unknown action"}
 
 
-ULTIMATE_TERMINAL_HTML = """
+VECTOR_DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Wall Street Quant Terminal // Pro 10x Futures</title>
+    <title>AETHEL // Institutional Quant Terminal</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
-            --bg-color: #020617;
-            --panel-bg: #090d16;
-            --border-color: #1e293b;
+            --bg-base: #0b0f19;
+            --panel-bg: #111827;
+            --border-line: #1f2937;
+            --accent-orange: #f59e0b;
             --accent-cyan: #06b6d4;
             --accent-green: #10b981;
             --accent-red: #ef4444;
             --text-main: #f8fafc;
-            --text-muted: #64748b;
+            --text-muted: #94a3b8;
         }
-        body { background-color: var(--bg-color); color: var(--text-main); font-family: 'Inter', system-ui, sans-serif; margin: 0; padding: 24px; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; flex-wrap: wrap; gap: 12px; }
-        .title { font-size: 24px; font-weight: 800; background: linear-gradient(90deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        body { background-color: var(--bg-base); color: var(--text-main); font-family: 'Inter', system-ui, sans-serif; margin: 0; padding: 24px; }
         
-        .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-        .btn { background: #1e293b; color: #f8fafc; border: 1px solid #334155; padding: 8px 16px; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+        /* Top Navigation Header */
+        .top-nav { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-line); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }
+        .brand-box { display: flex; align-items: center; gap: 12px; }
+        .brand-logo { width: 36px; height: 36px; background: linear-gradient(135deg, #f59e0b, #d97706); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 18px; color: #fff; box-shadow: 0 0 15px rgba(245,158,11,0.3); }
+        .brand-title { font-size: 18px; font-weight: 800; letter-spacing: 0.05em; color: #fff; }
+        .brand-sub { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; }
+        
+        .nav-links { display: flex; gap: 24px; font-size: 13px; font-weight: 600; color: var(--text-muted); }
+        .nav-link { cursor: pointer; transition: color 0.2s; }
+        .nav-link:hover, .nav-link.active { color: var(--accent-orange); }
+
+        .market-status { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .status-pill { background: rgba(16, 185, 129, 0.1); color: var(--accent-green); border: 1px solid rgba(16, 185, 129, 0.3); padding: 5px 12px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; }
+        .status-pill.paused { background: rgba(239, 68, 68, 0.1); color: var(--accent-red); border-color: rgba(239, 68, 68, 0.3); }
+
+        .btn-group { display: flex; gap: 8px; }
+        .btn { background: #1e293b; color: #fff; border: 1px solid #334155; padding: 6px 14px; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; transition: all 0.2s; }
         .btn:hover { background: #334155; }
-        .btn-pause { background: rgba(239, 68, 68, 0.2); color: #f87171; border-color: rgba(239, 68, 68, 0.4); }
-        .btn-resume { background: rgba(16, 185, 129, 0.2); color: #34d399; border-color: rgba(16, 185, 129, 0.4); }
-        .btn-close { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border-color: rgba(245, 158, 11, 0.4); }
-        
-        .badge { background: rgba(16, 185, 129, 0.1); color: var(--accent-green); border: 1px solid rgba(16, 185, 129, 0.3); padding: 6px 14px; border-radius: 999px; font-size: 12px; font-weight: 700; }
-        .badge-paused { background: rgba(239, 68, 68, 0.1); color: var(--accent-red); border: 1px solid rgba(239, 68, 68, 0.3); }
+        .btn-orange { background: #d97706; border-color: #f59e0b; color: #fff; }
+        .btn-orange:hover { background: #b45309; }
 
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .card { background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 14px; padding: 20px; position: relative; overflow: hidden; }
-        .card::before { content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: var(--accent-cyan); }
-        .card-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; font-weight: 600; }
-        .card-val { font-size: 24px; font-weight: 800; color: var(--text-main); }
+        /* Top Executive Header Cards */
+        .exec-header { background: var(--panel-bg); border: 1px solid var(--border-line); border-radius: 12px; padding: 20px; display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 20px; margin-bottom: 24px; align-items: center; }
+        @media(max-width: 1024px) { .exec-header { grid-template-columns: 1fr; } }
+        .exec-main-val { font-size: 32px; font-weight: 900; color: #fff; margin-top: 4px; }
+        .exec-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; }
+        .exec-sub { font-size: 12px; color: var(--accent-green); font-weight: 600; margin-top: 4px; }
+        .exec-stat-box { border-left: 1px solid var(--border-line); padding-left: 20px; }
 
-        .dashboard-layout { display: grid; grid-template-columns: 3fr 1fr; gap: 24px; margin-bottom: 24px; }
-        @media (max-width: 1024px) { .dashboard-layout { grid-template-columns: 1fr; } }
+        /* Metrics Grid */
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .metric-card { background: var(--panel-bg); border: 1px solid var(--border-line); border-radius: 10px; padding: 16px; }
+        .metric-title { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; font-weight: 600; }
+        .metric-val { font-size: 22px; font-weight: 800; color: #fff; }
 
-        .panel { background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 14px; padding: 20px; margin-bottom: 24px; }
-        .panel-title { font-size: 13px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 16px; font-weight: 700; letter-spacing: 0.05em; display: flex; justify-content: space-between; align-items: center; }
+        /* Main Dashboard Grid */
+        .main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; margin-bottom: 24px; }
+        @media(max-width: 1024px) { .main-grid { grid-template-columns: 1fr; } }
 
-        .positions-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
-        .pos-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; position: relative; }
-        .pos-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-weight: 700; font-size: 14px; }
-        .pos-row { display: flex; justify-content: space-between; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
-        .pos-val { color: #f1f5f9; font-weight: 600; }
+        .panel { background: var(--panel-bg); border: 1px solid var(--border-line); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+        .panel-header { font-size: 12px; color: var(--text-muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
 
-        .progress-container { background: #1e293b; border-radius: 999px; height: 8px; width: 100%; margin-top: 12px; overflow: hidden; position: relative; }
-        .progress-bar { background: linear-gradient(90deg, #06b6d4, #10b981); height: 100%; border-radius: 999px; transition: width 0.4s ease; }
-        .progress-labels { display: flex; justify-content: space-between; font-size: 10px; color: #64748b; margin-top: 4px; }
+        /* Positions & Tables */
+        .positions-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+        .pos-card { background: #0b0f19; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; }
+        .pos-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-weight: 700; font-size: 13px; }
+        .pos-info { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+        .pos-num { color: #fff; font-weight: 600; }
 
-        .radar-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #0f172a; border-radius: 8px; margin-bottom: 8px; font-size: 13px; border: 1px solid #1e293b; }
-        
+        .progress-bar-bg { background: #1e293b; height: 6px; border-radius: 999px; margin-top: 10px; overflow: hidden; }
+        .progress-bar-fill { background: linear-gradient(90deg, #f59e0b, #10b981); height: 100%; border-radius: 999px; }
+
+        .radar-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: #0b0f19; border-radius: 6px; margin-bottom: 8px; font-size: 12px; border: 1px solid #1e293b; }
+
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { text-align: left; padding: 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-color); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
-        td { padding: 12px; border-bottom: 1px solid #111827; }
+        th { text-align: left; padding: 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-line); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+        td { padding: 12px; border-bottom: 1px solid rgba(31, 41, 55, 0.5); }
 
-        .status-open { color: var(--accent-cyan); font-weight: 700; }
-        .status-closed { color: var(--text-muted); }
-        .pos-pnl { color: var(--accent-green); font-weight: 700; }
-        .neg-pnl { color: var(--accent-red); font-weight: 700; }
-        .tag-long { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-        .tag-short { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-        .shield-badge { background: #1e3a8a; color: #93c5fd; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+        .tag-long { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+        .tag-short { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+        .pnl-pos { color: var(--accent-green); font-weight: 700; }
+        .pnl-neg { color: var(--accent-red); font-weight: 700; }
 
-        /* Toast Popup Notification Style */
-        #toast { visibility: hidden; min-width: 250px; background-color: #1e293b; color: #fff; text-align: center; border-radius: 8px; padding: 12px; position: fixed; z-index: 1000; right: 30px; bottom: 30px; font-size: 14px; border: 1px solid #334155; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
-        #toast.show { visibility: visible; animation: fadein 0.5s, fadeout 0.5s 2.5s; }
+        #toast { visibility: hidden; min-width: 240px; background-color: #1e293b; color: #fff; text-align: center; border-radius: 8px; padding: 12px; position: fixed; z-index: 1000; right: 30px; bottom: 30px; font-size: 13px; border: 1px solid #334155; }
+        #toast.show { visibility: visible; animation: fadein 0.4s, fadeout 0.4s 2.5s; }
         @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
         @keyframes fadeout { from {bottom: 30px; opacity: 1;} to {bottom: 0; opacity: 0;} }
     </style>
 </head>
 <body>
-    <div id="toast">Command executed successfully!</div>
+    <div id="toast">Command executed successfully</div>
 
-    <div class="header">
-        <div class="title">⚡ WALL STREET QUANT TERMINAL // 10x Futures Pro</div>
-        <div class="header-actions">
-            <button class="btn btn-pause" onclick="controlBot('pause')">⏸️ Pause Bot</button>
-            <button class="btn btn-resume" onclick="controlBot('resume')">▶️ Resume</button>
-            <button class="btn btn-close" onclick="controlBot('closeall')">🚨 Close All</button>
-            <div class="badge" id="bot-status-badge">● SYSTEM ACTIVE</div>
+    <!-- Top Navigation Bar -->
+    <div class="top-nav">
+        <div class="brand-box">
+            <div class="brand-logo">AE</div>
+            <div>
+                <div class="brand-title">AETHEL CAPITAL MANAGEMENT</div>
+                <div class="brand-sub">Global Discretionary Multi-Asset Futures Strategy</div>
+            </div>
         </div>
-    </div>
-    
-    <div class="grid">
-        <div class="card">
-            <div class="card-label">Total Portfolio Equity</div>
-            <div class="card-val" id="total-equity">$1,000.00</div>
+        <div class="nav-links">
+            <span class="nav-link active">Overview</span>
+            <span class="nav-link">Asset Allocation</span>
+            <span class="nav-link">Performance</span>
+            <span class="nav-link">Risk & Factor Analytics</span>
+            <span class="nav-link">Reports (FY2026)</span>
         </div>
-        <div class="card" style="--accent-cyan: #38bdf8;">
-            <div class="card-label">Available Wallet Cash</div>
-            <div class="card-val" id="avail-cash">$1,000.00</div>
-        </div>
-        <div class="card" style="--accent-cyan: #10b981;">
-            <div class="card-label">Realized Net PnL</div>
-            <div class="card-val" id="realized-pnl">$0.00</div>
-        </div>
-        <div class="card" style="--accent-cyan: #818cf8;">
-            <div class="card-label">Win Rate & Closed</div>
-            <div class="card-val" id="win-rate">0.0% (0)</div>
-        </div>
-        <div class="card" style="--accent-cyan: #f59e0b;">
-            <div class="card-label">Directional Exposure</div>
-            <div class="card-val" id="exposure-balance">0L / 0S</div>
+        <div class="market-status">
+            <div class="btn-group">
+                <button class="btn" onclick="controlBot('pause')">Pause</button>
+                <button class="btn btn-orange" onclick="controlBot('resume')">Resume</button>
+                <button class="btn" style="background:#7f1d1d; border-color:#991b1b;" onclick="controlBot('closeall')">Close All</button>
+            </div>
+            <div class="status-pill" id="bot-status-pill">● MARKET OPEN // 10X PRO</div>
         </div>
     </div>
 
-    <div class="dashboard-layout">
+    <!-- Executive Header Banner -->
+    <div class="exec-header">
         <div>
+            <div class="exec-label">Net Asset Value (AUM)</div>
+            <div class="exec-main-val" id="total-equity">$1,000.00</div>
+            <div class="exec-sub">Benchmark: Binance Vision WSS (50 Assets) + Multi-Timeframe Trend</div>
+        </div>
+        <div class="exec-stat-box">
+            <div class="exec-label">Realized Net PnL</div>
+            <div class="metric-val" id="realized-pnl" style="margin-top:4px;">$0.00</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Live Execution Fee Included</div>
+        </div>
+        <div class="exec-stat-box">
+            <div class="exec-label">Win Rate & Closed</div>
+            <div class="metric-val" id="win-rate" style="margin-top:4px;">0.0%</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;" id="total-closed-lbl">0 trades closed</div>
+        </div>
+        <div class="exec-stat-box">
+            <div class="exec-label">Directional Exposure</div>
+            <div class="metric-val" id="exposure-balance" style="margin-top:4px; color:var(--accent-orange);">0L / 0S</div>
+            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">Max Cap: 3 / Side</div>
+        </div>
+    </div>
+
+    <!-- Secondary Metrics Grid -->
+    <div class="metrics-grid">
+        <div class="metric-card">
+            <div class="metric-title">Available Cash</div>
+            <div class="metric-val" id="avail-cash">$1,000.00</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Active Slots Occupied</div>
+            <div class="metric-val" id="active-slots">0 / 5</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Leverage Model</div>
+            <div class="metric-val">10x Isolated</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Risk Engine</div>
+            <div class="metric-val" style="color:var(--accent-green);">ATR (1.5x SL / 3x TP)</div>
+        </div>
+    </div>
+
+    <!-- Main Grid Layout -->
+    <div class="main-grid">
+        <div>
+            <!-- Active Positions Panel -->
             <div class="panel">
-                <div class="panel-title">Active Live Positions & SL / Liquidation Watch</div>
+                <div class="panel-header">
+                    <span>Active Portfolio Holdings & Real-Time Performance</span>
+                    <span style="font-size:10px; color:var(--accent-cyan);">WSS Feed Synchronized</span>
+                </div>
                 <div class="positions-grid" id="active-positions-container">
                     <div style="color: var(--text-muted); font-size: 13px; font-style: italic;">No active positions open right now...</div>
                 </div>
             </div>
 
+            <!-- Cumulative Performance Chart Panel -->
             <div class="panel">
-                <div class="panel-title">Real-Time Portfolio Equity Curve (USD)</div>
-                <canvas id="equityChart" height="65"></canvas>
+                <div class="panel-header"><span>Cumulative Performance (FY2026 Equity Curve)</span></div>
+                <canvas id="equityChart" height="75"></canvas>
             </div>
         </div>
 
         <div>
-            <div class="panel" style="height: 100%;">
-                <div class="panel-title">Market Scanner Radar (Top Movers)</div>
+            <!-- Market Scanner Radar Panel -->
+            <div class="panel" style="height: calc(100% - 40px);">
+                <div class="panel-header"><span>Market Scanner Radar</span></div>
                 <div id="radar-container">
-                    <div style="color: var(--text-muted); font-size: 12px; font-style: italic;">Syncing 50 WSS tokens...</div>
+                    <div style="color: var(--text-muted); font-size: 12px; font-style: italic;">Scanning top 50 perpetual assets...</div>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- Recent Trade Activity Table -->
     <div class="panel">
-        <div class="panel-title">Recent Trade & Scale-Out Activity Log</div>
+        <div class="panel-header"><span>Recent Trade Activity & Scale-Out Execution Matrix</span></div>
         <table>
             <thead>
                 <tr>
-                    <th>Time</th>
-                    <th>Token</th>
+                    <th>Timestamp</th>
+                    <th>Asset Name</th>
                     <th>Action</th>
                     <th>Entry Price</th>
                     <th>Exit Price</th>
@@ -352,8 +412,8 @@ ULTIMATE_TERMINAL_HTML = """
 
     <script>
         const ctx = document.getElementById('equityChart').getContext('2d');
-        const equityData = { labels: [], datasets: [{ label: 'Portfolio Equity ($)', data: [], borderColor: '#06b6d4', backgroundColor: 'rgba(6, 182, 212, 0.08)', borderWidth: 2, fill: true, tension: 0.35 }] };
-        const chart = new Chart(ctx, { type: 'line', data: equityData, options: { plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1e293b' } } } } });
+        const equityData = { labels: [], datasets: [{ label: 'Portfolio Equity ($)', data: [], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.08)', borderWidth: 2, fill: true, tension: 0.3 }] };
+        const chart = new Chart(ctx, { type: 'line', data: equityData, options: { plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1f2937' } }, y: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1f2937' } } } } });
 
         function showToast(msg) {
             const x = document.getElementById("toast");
@@ -363,7 +423,7 @@ ULTIMATE_TERMINAL_HTML = """
         }
 
         async function controlBot(action) {
-            if(!confirm('Are you sure you want to execute action: ' + action.toUpperCase() + '?')) return;
+            if(!confirm('Execute institutional command: ' + action.toUpperCase() + '?')) return;
             try {
                 const res = await fetch('/api/control', {
                     method: 'POST',
@@ -371,9 +431,9 @@ ULTIMATE_TERMINAL_HTML = """
                     body: JSON.stringify({ action: action })
                 });
                 const data = await res.json();
-                showToast('Success: ' + action.toUpperCase() + ' command sent!');
+                showToast('Success: ' + action.toUpperCase() + ' command transmitted.');
                 refreshData();
-            } catch(e) { showToast('Error: ' + e); }
+            } catch(e) { showToast('Execution Error: ' + e); }
         }
 
         async function refreshData() {
@@ -386,18 +446,20 @@ ULTIMATE_TERMINAL_HTML = """
                     
                     const pnlEl = document.getElementById('realized-pnl');
                     pnlEl.textContent = (m.realized_pnl >= 0 ? '+$' : '-$') + Math.abs(m.realized_pnl).toFixed(2);
-                    pnlEl.className = 'card-val ' + (m.realized_pnl >= 0 ? 'pos-pnl' : 'neg-pnl');
+                    pnlEl.className = 'metric-val ' + (m.realized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg');
                     
-                    document.getElementById('win-rate').textContent = m.win_rate.toFixed(1) + '% (' + m.total_closed + ')';
+                    document.getElementById('win-rate').textContent = m.win_rate.toFixed(1) + '%';
+                    document.getElementById('total-closed-lbl').textContent = m.total_closed + ' trades closed';
                     document.getElementById('exposure-balance').textContent = m.long_count + 'L / ' + m.short_count + 'S';
+                    document.getElementById('active-slots').textContent = m.active_positions_count + ' / ' + m.max_concurrent;
 
-                    const badge = document.getElementById('bot-status-badge');
+                    const pill = document.getElementById('bot-status-pill');
                     if (m.trading_enabled) {
-                        badge.textContent = '● SYSTEM ACTIVE';
-                        badge.className = 'badge';
+                        pill.textContent = '● MARKET OPEN // 10X PRO';
+                        pill.className = 'status-pill';
                     } else {
-                        badge.textContent = '⏸️ PAUSED';
-                        badge.className = 'badge badge-paused';
+                        pill.textContent = '⏸️ TRADING PAUSED';
+                        pill.className = 'status-pill paused';
                     }
 
                     const posContainer = document.getElementById('active-positions-container');
@@ -405,25 +467,18 @@ ULTIMATE_TERMINAL_HTML = """
                         posContainer.innerHTML = '';
                         m.positions.forEach(p => {
                             const isLong = p.side === 'LONG';
-                            const pnlClass = p.unrealized_pnl >= 0 ? 'pos-pnl' : 'neg-pnl';
-                            const shieldHtml = p.be_active ? ' <span class="shield-badge">BE SHIELD 🛡️</span>' : '';
-                            
+                            const pnlClass = p.unrealized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
                             const div = document.createElement('div');
                             div.className = 'pos-card';
                             div.innerHTML = `
-                                <div class="pos-header">
-                                    <span>${p.symbol} <span class="${isLong ? 'tag-long' : 'tag-short'}">${p.side} 10x</span>${shieldHtml}</span>
+                                <div class="pos-top">
+                                    <span>${p.symbol} <span class="${isLong ? 'tag-long' : 'tag-short'}">${p.side} 10x</span></span>
                                     <span class="${pnlClass}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl.toFixed(2)} (${p.roe_pct >= 0 ? '+' : ''}${p.roe_pct.toFixed(1)}%)</span>
                                 </div>
-                                <div class="pos-row"><span>Entry Price:</span><span class="pos-val">$${p.entry_price.toFixed(5)}</span></div>
-                                <div class="pos-row"><span>Live WSS Price:</span><span class="pos-val" style="color: #38bdf8;">$${p.current_price.toFixed(5)}</span></div>
-                                <div class="pos-row"><span>Stop-Loss (SL):</span><span class="pos-val" style="color: #ef4444;">$${p.sl_price.toFixed(5)}</span></div>
-                                <div class="pos-row"><span>Est. Liq Price:</span><span class="pos-val" style="color: #f59e0b;">$${p.liq_price.toFixed(5)}</span></div>
-                                <div class="pos-row"><span>Target TP:</span><span class="pos-val">$${p.tp_price.toFixed(5)}</span></div>
-                                <div class="progress-container">
-                                    <div class="progress-bar" style="width: ${p.progress_pct}%;"></div>
-                                </div>
-                                <div class="progress-labels"><span>Entry (0%)</span><span>TP Target (${p.progress_pct}%)</span></div>
+                                <div class="pos-info"><span>Entry Price:</span><span class="pos-num">$${p.entry_price.toFixed(5)}</span></div>
+                                <div class="pos-info"><span>Live WSS Price:</span><span class="pos-num" style="color:var(--accent-cyan);">$${p.current_price.toFixed(5)}</span></div>
+                                <div class="pos-info"><span>Stop-Loss / Liq:</span><span class="pos-num" style="color:var(--accent-red);">$${p.sl_price.toFixed(5)}</span></div>
+                                <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${p.progress_pct}%;"></div></div>
                             `;
                             posContainer.appendChild(div);
                         });
@@ -437,7 +492,7 @@ ULTIMATE_TERMINAL_HTML = """
                         m.radar.forEach(r => {
                             const col = r.change_pct >= 0 ? '#10b981' : '#ef4444';
                             const item = document.createElement('div');
-                            item.className = 'radar-item';
+                            item.className = 'radar-row';
                             item.innerHTML = `
                                 <span><b>${r.symbol}</b></span>
                                 <span>$${r.price < 1 ? r.price.toFixed(5) : r.price.toFixed(2)}</span>
@@ -462,7 +517,7 @@ ULTIMATE_TERMINAL_HTML = """
                     const tr = document.createElement('tr');
                     const pnlVal = t.pnl ? parseFloat(t.pnl) : 0;
                     const pnlStr = t.status === 'CLOSED' ? ((pnlVal >= 0 ? '+$' : '-$') + Math.abs(pnlVal).toFixed(2)) : '-';
-                    const pnlCls = t.status === 'CLOSED' ? (pnlVal >= 0 ? 'pos-pnl' : 'neg-pnl') : '';
+                    const pnlCls = t.status === 'CLOSED' ? (pnlVal >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
                     tr.innerHTML = `
                         <td>${t.timestamp || '-'}</td>
                         <td><b>${t.token_symbol}</b></td>
@@ -470,7 +525,7 @@ ULTIMATE_TERMINAL_HTML = """
                         <td>$${parseFloat(t.entry_price || 0).toFixed(5)}</td>
                         <td>${t.exit_price ? '$' + parseFloat(t.exit_price).toFixed(5) : '-'}</td>
                         <td class="${pnlCls}">${pnlStr}</td>
-                        <td class="${t.status === 'OPEN' ? 'status-open' : 'status-closed'}">${t.status}</td>
+                        <td class="${t.status === 'OPEN' ? 'tag-long' : 'status-closed'}">${t.status}</td>
                     `;
                     tbody.appendChild(tr);
                 });
@@ -486,4 +541,4 @@ ULTIMATE_TERMINAL_HTML = """
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
-    return ULTIMATE_TERMINAL_HTML
+    return VECTOR_DASHBOARD_HTML
