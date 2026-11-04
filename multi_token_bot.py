@@ -83,7 +83,7 @@ class MultiTokenBot:
         self.engine = PaperTradingEngine(
             initial_capital=config.STARTING_CAPITAL,
             max_concurrent=5,
-            max_same_side=3  # Institutional exposure cap: max 3 LONGs and 3 SHORTs
+            max_same_side=3
         )
         self.is_running = True
         self.trading_enabled = True
@@ -250,7 +250,6 @@ class MultiTokenBot:
 
                     verified_picks.sort(key=lambda x: x["score"], reverse=True)
 
-                    # Execute trades respecting both Max Concurrent Slots (5) and Directional Cap (Max 3 per side)
                     for pick in verified_picks:
                         if len(self.engine.positions) >= self.engine.max_concurrent:
                             break
@@ -266,8 +265,9 @@ class MultiTokenBot:
                         if not self.engine.can_open_position(sym, side=sig):
                             continue
 
-                        margin_amount = self.engine.calculate_position_size()
-                        order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p, custom_atr=atr)
+                        # Dynamic Position Sizing based on score conviction
+                        margin_amount = self.engine.calculate_position_size(score=score)
+                        order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p, custom_atr=atr, score=score)
 
                         if order_success:
                             pos = self.engine.positions.get(sym, {})
@@ -275,7 +275,6 @@ class MultiTokenBot:
                             partial_p = pos.get("partial_tp_price", entry_p)
                             tp_p = pos.get("tp_price", entry_p)
                             sl_p = pos.get("sl_price", entry_p)
-                            liq_p = pos.get("liq_price", entry_p)
 
                             await asyncio.to_thread(
                                 record_trade_db,
@@ -291,10 +290,13 @@ class MultiTokenBot:
                             long_count = sum(1 for p in self.engine.positions.values() if p["side"] == "LONG")
                             short_count = sum(1 for p in self.engine.positions.values() if p["side"] == "SHORT")
 
+                            conviction_badge = "🔥 High (2.5%)" if score >= 90 else ("⚡ Standard (2.0%)" if score >= 75 else "⚠️ Baseline (1.5%)")
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Hedged Quant " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Dynamic Sized " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
+                                "• Conviction Tier: `" + conviction_badge + "`\n"
+                                "• Allocated Margin: `$" + f"{margin_amount:.2f}" + " ($" + f"{margin_amount * self.engine.leverage:.2f}" + " exp)`\n"
                                 "• Exposure Balance: `" + str(long_count) + "L / " + str(short_count) + "S (Cap: 3)` ⚖️\n"
                                 "• Macro Alignment: `" + m_trend + " + 15m " + sig + "` 🧭\n"
                                 "• Volume Spike: `" + f"{v_ratio:.2f}x" + " Avg Vol` 🔥\n"
@@ -348,14 +350,14 @@ class MultiTokenBot:
                                     short_c += 1
                                 be_tag = " [BE🛡️]" if p.get("partial_tp_done") else ""
                                 margin_str = f"{p['margin']:.2f}"
-                                line = "• " + sym + " (" + side_str + be_tag + "): $" + margin_str + " | Ent $" + entry_str + " | SL $" + sl_str + " | TP $" + tp_str
+                                line = "• " + sym + " (" + side_str + be_tag + "): Margin $" + margin_str + " | Ent $" + entry_str + " | SL $" + sl_str + " | TP $" + tp_str
                                 active_desc.append(line)
                             pos_text = "\n".join(active_desc) if active_desc else "None (0/5 Active Slots)"
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
                             status_reply = (
-                                "📊 *Institutional Futures Quant Status:*\n"
+                                "📊 *Chama Capital Management Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Stream Feed: " + ws_str + "\n"
                                 "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
@@ -379,7 +381,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* Institutional Quant Engine active."
+                                "▶️ *Trading Resumed!* Dynamic Sizing Engine active."
                             )
 
                         elif text == "/closeall":
@@ -402,12 +404,11 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Upgrade 4 Complete: Institutional Quant Engine Fully Armed!*\n"
-            "• Exposure Cap: Max 3 LONGs / Max 3 SHORTs (Anti-Correlation Hedge) ⚖️\n"
-            "• Scale-Out: 50% Profit Lock at +1.5x ATR + Auto Break-Even 🛡️\n"
-            "• Multi-Timeframe: 1H Macro + 15m Micro Alignment 🧭\n"
-            "• Volume Spike: >=1.10x 20-SMA Filter 🔥\n"
-            "• Tick Stream: Binance Vision Real-Time WSS"
+            "🚀 *Dynamic Position Sizing Upgrade Online!*\n"
+            "• Score >= 90: High Conviction (2.5% / $25 Margin)\n"
+            "• Score >= 75: Standard Conviction (2.0% / $20 Margin)\n"
+            "• Score < 75: Baseline (1.5% / $15 Margin)\n"
+            "• Directional Cap: Max 3 Long / 3 Short"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
