@@ -1,45 +1,20 @@
 import os
 import asyncio
-import sqlite3
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import config
+import database
 from multi_token_bot import MultiTokenBot
-
-DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 
 bot_instance = MultiTokenBot()
 
 
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                token_symbol TEXT,
-                action TEXT,
-                amount REAL,
-                entry_price REAL,
-                exit_price REAL,
-                pnl REAL,
-                status TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[DB Init Error]:", e)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    database.init_db()
     print("[Dashboard Server] Launching MultiTokenBot background engine...")
     bot_task = asyncio.create_task(bot_instance.run_parallel_trading())
     yield
@@ -91,7 +66,6 @@ async def get_metrics():
             partial_tp = p.get("partial_tp_price", tp)
             opened_at = p.get("opened_at", now_sec)
 
-            # Calculate Holding Age
             elapsed_m = int((now_sec - opened_at) / 60)
             age_str = f"{elapsed_m // 60}h {elapsed_m % 60}m" if elapsed_m >= 60 else f"{elapsed_m}m"
 
@@ -133,17 +107,7 @@ async def get_metrics():
         donut_labels.append("Reserve Cash")
         donut_values.append(round(available_cash, 2))
 
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trades WHERE status = 'CLOSED'")
-        row = cursor.fetchone()
-        
-        cursor.execute("SELECT pnl FROM trades WHERE status = 'CLOSED' ORDER BY id ASC")
-        all_closed = [r[0] for r in cursor.fetchall()]
-        conn.close()
-        
-        total_closed = row[0] if row and row[0] else 0
-        winning_trades = row[1] if row and row[1] else 0
+        total_closed, winning_trades, all_closed = database.fetch_closed_stats()
         win_rate = round((winning_trades / total_closed * 100.0), 1) if total_closed > 0 else 0.0
 
         peak = starting_capital
@@ -186,6 +150,7 @@ async def get_metrics():
             "max_concurrent": getattr(config, "MAX_CONCURRENT_TRADES", 5),
             "trading_enabled": bot_instance.trading_enabled,
             "btc_regime": bot_instance.btc_regime,
+            "database_engine": "Cloud PostgreSQL" if database.is_postgres else "Local SQLite",
             "long_count": long_count,
             "short_count": short_count,
             "positions": positions_list,
@@ -197,21 +162,7 @@ async def get_metrics():
 
 @app.get("/api/trades")
 async def get_trades():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, timestamp, token_symbol, action, amount, entry_price, exit_price, pnl, status
-            FROM trades
-            ORDER BY id DESC
-            LIMIT 50
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(ix) for ix in rows]
-    except Exception as e:
-        return {"error": str(e)}
+    return database.fetch_recent_trades(limit=50)
 
 
 @app.post("/api/control")
@@ -370,6 +321,7 @@ CHAMA_DASHBOARD_HTML = """
             <span class="nav-link">Reports (FY2026)</span>
         </div>
         <div class="market-status">
+            <div class="regime-pill" id="db-engine-pill">🗄️ DB: LOCAL SQLITE</div>
             <div class="regime-pill" id="btc-regime-pill">🛡️ BTC: STABLE</div>
             <div class="btn-group">
                 <button class="btn" onclick="controlBot('pause')">Pause</button>
@@ -409,7 +361,7 @@ CHAMA_DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Secondary Metrics Grid with Zombie Protocol -->
+    <!-- Secondary Metrics Grid with Cloud DB Persistence -->
     <div class="metrics-grid">
         <div class="metric-card">
             <div class="metric-title">Available Cash</div>
@@ -420,8 +372,8 @@ CHAMA_DASHBOARD_HTML = """
             <div class="metric-val" id="active-slots">0 / 5</div>
         </div>
         <div class="metric-card">
-            <div class="metric-title">Zombie Exit</div>
-            <div class="metric-val" style="color:var(--accent-cyan); font-size: 15px; margin-top: 4px;">🧟 3h Limit Active</div>
+            <div class="metric-title">Cloud Persistence</div>
+            <div class="metric-val" id="db-state-lbl" style="color:var(--accent-cyan); font-size: 15px; margin-top: 4px;">🗄️ Synced</div>
         </div>
         <div class="metric-card">
             <div class="metric-title">Risk Model</div>
@@ -509,7 +461,7 @@ CHAMA_DASHBOARD_HTML = """
 
         const ctx = document.getElementById('equityChart').getContext('2d');
         const equityData = { labels: [], datasets: [{ label: 'Equity ($)', data: [], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.08)', borderWidth: 2, fill: true, tension: 0.3 }] };
-        const equityChart = new Chart(ctx, { type: 'line', data: equityData, options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e293b' } } } } });
+        const equityChart = new Chart(ctx, { type: 'line', data: equityData, options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e2937' } }, y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e2937' } } } } });
 
         const palette = ['#06b6d4', '#10b981', '#f59e0b', '#818cf8', '#ec4899', '#8b5cf6', '#14b8a6', '#64748b'];
         const donutCtx = document.getElementById('donutChart').getContext('2d');
@@ -602,6 +554,14 @@ CHAMA_DASHBOARD_HTML = """
                     document.getElementById('win-rate-lbl').textContent = m.win_rate.toFixed(1) + '% Win Rate (' + m.total_closed + ')';
                     document.getElementById('exposure-balance').textContent = m.long_count + 'L / ' + m.short_count + 'S';
                     document.getElementById('active-slots').textContent = m.active_positions_count + ' / ' + m.max_concurrent;
+
+                    // Update Database Persistence Pill
+                    const dbPill = document.getElementById('db-engine-pill');
+                    const dbLbl = document.getElementById('db-state-lbl');
+                    if (m.database_engine) {
+                        dbPill.textContent = '🗄️ ' + m.database_engine.toUpperCase();
+                        dbLbl.textContent = m.database_engine.includes('Postgres') ? '🗄️ Supabase Cloud' : '📁 Local SQLite';
+                    }
 
                     const rPill = document.getElementById('btc-regime-pill');
                     if (m.btc_regime) {
