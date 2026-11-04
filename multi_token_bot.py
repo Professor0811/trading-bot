@@ -144,8 +144,12 @@ class MultiTokenBot:
                         "CLOSED"
                     )
 
+                    # Distinguish between normal exit and Zombie Stagnant Killer
+                    is_zombie = "Zombie" in str(event.get("reason", ""))
+                    header_icon = "🧟 *Zombie Trade Killer (Slot Freed!)*" if is_zombie else "🏁 *Real-Time Exit (Slot Freed!)*"
+
                     alert_msg = (
-                        "🏁 *Real-Time Exit (Slot Freed!)*\n"
+                        header_icon + "\n"
                         "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                         "• Reason: `" + str(event['reason']) + "`\n"
                         "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
@@ -191,14 +195,13 @@ class MultiTokenBot:
     async def klines_entry_scanner_loop(self):
         while self.is_running:
             try:
-                # 1. Update BTC Market Regime Filter (Crash Detector)
+                # 1. Update BTC Market Regime Filter
                 regime_data = await asyncio.to_thread(strategy_agent.check_btc_market_regime)
                 self.btc_regime = regime_data
 
-                # Send Alert if Crash Regime Triggered
                 now_ts = asyncio.get_event_loop().time()
                 if regime_data.get("regime") in ["CRASH", "BEAR"] and not regime_data.get("allow_long"):
-                    if (now_ts - self.last_crash_alert_time) > 600:  # Alert at most once per 10 mins
+                    if (now_ts - self.last_crash_alert_time) > 600:
                         self.last_crash_alert_time = now_ts
                         await asyncio.to_thread(
                             send_telegram_alert,
@@ -256,7 +259,6 @@ class MultiTokenBot:
                             bin_sym
                         )
 
-                        # Enforce BTC Regime Filter: Block LONG if BTC is crashing/bearish
                         if signal == "LONG" and not self.btc_regime.get("allow_long", True):
                             continue
 
@@ -385,7 +387,8 @@ class MultiTokenBot:
                             status_reply = (
                                 "📊 *Chama Capital Management Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
-                                "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + " (" + self.btc_regime.get("reason", "") + ")`\n"
+                                "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + "`\n"
+                                "• Zombie Killer: `Active (3h Stagnant Filter)` 🧟\n"
                                 "• Stream Feed: " + ws_str + "\n"
                                 "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
                                 "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
@@ -408,7 +411,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* Dynamic Sizing & BTC Regime Guard active."
+                                "▶️ *Trading Resumed!* Quant Engine active."
                             )
 
                         elif text == "/closeall":
@@ -431,11 +434,11 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Upgrade 2 Complete: BTC Market Regime Filter Online!*\n"
-            "• Crash Guard: Detects rapid BTC dump (>= -1.2%) 📉\n"
-            "• Long Protection: Locks Altcoin LONGs during dump 🛡️\n"
-            "• Short Execution: Prioritizes high-momentum SHORTs\n"
-            "• Dynamic Sizing: Sized by Conviction Score"
+            "🚀 *Upgrade 3 Complete: Time-Based Stagnant Trade Killer Online!*\n"
+            "• Zombie Filter: Auto-closes trades stagnant > 3 hours (within ±0.35%) 🧟\n"
+            "• Slot Optimization: Reclaims idle capital for top momentum movers\n"
+            "• Runner Immunity: Risk-free runner trades protected\n"
+            "• BTC Crash Guard & Dynamic Sizing active"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
