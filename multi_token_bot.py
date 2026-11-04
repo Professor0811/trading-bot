@@ -8,33 +8,12 @@ import config
 import risk_manager
 import strategy_agent
 import database
+from bybit_connector import bybit_client
 from paper_engine import PaperTradingEngine
 from telegram_alerts import send_telegram_alert
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-TOP_50_MAP = {
-    "BTC/USDC": "BTCUSDT", "ETH/USDC": "ETHUSDT", "SOL/USDC": "SOLUSDT",
-    "BNB/USDC": "BNBUSDT", "XRP/USDC": "XRPUSDT", "DOGE/USDC": "DOGEUSDT",
-    "ADA/USDC": "ADAUSDT", "AVAX/USDC": "AVAXUSDT", "TRX/USDC": "TRXUSDT",
-    "LINK/USDC": "LINKUSDT", "DOT/USDC": "DOTUSDT", "NEAR/USDC": "NEARUSDT",
-    "SUI/USDC": "SUIUSDT", "MATIC/USDC": "POLUSDT", "LTC/USDC": "LTCUSDT",
-    "ICP/USDC": "ICPUSDT", "UNI/USDC": "UNIUSDT", "APT/USDC": "APTUSDT",
-    "PEPE/USDC": "PEPEUSDT", "SHIB/USDC": "SHIBUSDT", "FET/USDC": "FETUSDT",
-    "ETC/USDC": "ETCUSDT", "STX/USDC": "STXUSDT", "FIL/USDC": "FILUSDT",
-    "RENDER/USDC": "RENDERUSDT", "ATOM/USDC": "ATOMUSDT", "ARB/USDC": "ARBUSDT",
-    "IMX/USDC": "IMXUSDT", "WIF/USDC": "WIFUSDT", "OP/USDC": "OPUSDT",
-    "INJ/USDC": "INJUSDT", "HBAR/USDC": "HBARUSDT", "BONK/USDC": "BONKUSDT",
-    "VET/USDC": "VETUSDT", "GRT/USDC": "GRTUSDT", "TAO/USDC": "TAOUSDT",
-    "SEI/USDC": "SEIUSDT", "FLOKI/USDC": "FLOKIUSDT", "JUP/USDC": "JUPUSDT",
-    "RUNE/USDC": "RUNEUSDT", "TIA/USDC": "TIAUSDT", "ALGO/USDC": "ALGOUSDT",
-    "AAVE/USDC": "AAVEUSDT", "PYTH/USDC": "PYTHUSDT", "MKR/USDC": "MKRUSDT",
-    "GALA/USDC": "GALAUSDT", "FLOW/USDC": "FLOWUSDT", "DYDX/USDC": "DYDXUSDT",
-    "ORDI/USDC": "ORDIUSDT", "PENDLE/USDC": "PENDLEUSDT"
-}
-
-REVERSE_MAP = {v.lower(): k for k, v in TOP_50_MAP.items()}
 
 
 def fmt_p(val: float) -> str:
@@ -48,39 +27,27 @@ def fmt_p(val: float) -> str:
     return f"{val:.4f}"
 
 
-def fetch_vision_batch_prices() -> dict:
-    prices = {}
-    try:
-        res = requests.get("https://data-api.binance.vision/api/v3/ticker/price", timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            lookup = {item["symbol"]: float(item["price"]) for item in data if "symbol" in item and "price" in item}
-            for pair, b_sym in TOP_50_MAP.items():
-                if b_sym in lookup and lookup[b_sym] > 0:
-                    prices[pair] = lookup[b_sym]
-    except Exception as e:
-        print("[Vision Backup Error]:", e)
-    return prices
-
-
 class MultiTokenBot:
     def __init__(self):
         self.engine = PaperTradingEngine(
             initial_capital=config.STARTING_CAPITAL,
-            max_concurrent=5,
-            max_same_side=3
+            max_concurrent=config.MAX_CONCURRENT_TRADES,
+            max_same_side=config.MAX_SAME_SIDE_TRADES
         )
         self.is_running = True
         self.trading_enabled = True
         self.circuit_breaker_alerted = False
         self.ws_connected = False
         self.latest_prices = {}
-        self.price_history = {s: [] for s in TOP_50_MAP}
+        self.price_history = {}
+        self.market_radar = []
         self.btc_regime = {"regime": "STABLE", "allow_long": True, "allow_short": True, "reason": "System Initializing"}
         self.last_crash_alert_time = 0
 
     async def handle_fast_tick(self, symbol: str, current_price: float):
         self.latest_prices[symbol] = current_price
+        if symbol not in self.price_history:
+            self.price_history[symbol] = []
         history = self.price_history[symbol]
         if not history or history[-1] != current_price:
             history.append(current_price)
@@ -107,6 +74,7 @@ class MultiTokenBot:
 
                     alert_msg = (
                         "💰 *50% Partial Take-Profit + Auto Break-Even!*\n"
+                        "• Exchange: `Bybit V5 Linear` ⚡\n"
                         "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                         "• Milestone: `+1.5x ATR Reached` 🎯\n"
                         "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
@@ -134,6 +102,7 @@ class MultiTokenBot:
 
                     alert_msg = (
                         header_icon + "\n"
+                        "• Exchange: `Bybit V5 Linear` ⚡\n"
                         "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                         "• Reason: `" + str(event['reason']) + "`\n"
                         "• Entry Price: `$" + fmt_p(event['entry_price']) + "`\n"
@@ -144,41 +113,13 @@ class MultiTokenBot:
                     )
                     await asyncio.to_thread(send_telegram_alert, alert_msg)
 
-    async def websocket_stream_listener(self):
-        endpoints = [
-            "wss://data-stream.binance.vision/ws/!miniTicker@arr",
-            "wss://stream.binance.com:9443/ws/!miniTicker@arr"
-        ]
-        idx = 0
-
-        while self.is_running:
-            uri = endpoints[idx % len(endpoints)]
-            try:
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
-                    self.ws_connected = True
-                    await asyncio.to_thread(
-                        send_telegram_alert,
-                        "🔌 *WebSocket Stream Connected!*\n• Feed: Real-Time Binance Vision WSS"
-                    )
-
-                    async for message in ws:
-                        if not self.is_running:
-                            break
-                        data = json.loads(message)
-                        if isinstance(data, list):
-                            for item in data:
-                                b_sym = item.get("s", "").lower()
-                                price_str = item.get("c")
-                                if b_sym in REVERSE_MAP and price_str:
-                                    await self.handle_fast_tick(REVERSE_MAP[b_sym], float(price_str))
-            except Exception:
-                self.ws_connected = False
-                idx += 1
-                await asyncio.sleep(3)
-
-    async def klines_entry_scanner_loop(self):
+    async def bybit_scanner_and_trading_loop(self):
+        """
+        Institutional 2-Stage Market Scanner across all 300+ Bybit Perpetuals
+        """
         while self.is_running:
             try:
+                # 1. Update BTC Market Regime Filter
                 regime_data = await asyncio.to_thread(strategy_agent.check_btc_market_regime)
                 self.btc_regime = regime_data
 
@@ -188,17 +129,52 @@ class MultiTokenBot:
                         self.last_crash_alert_time = now_ts
                         await asyncio.to_thread(
                             send_telegram_alert,
-                            f"🚨 *BTC CRASH DETECTOR TRIGGERED!*\n"
+                            f"🚨 *BYBIT BTC CRASH DETECTOR TRIGGERED!*\n"
                             f"• State: `{regime_data['regime']}` 📉\n"
                             f"• Reason: `{regime_data['reason']}`\n"
-                            f"• Long Trading: `LOCKED ⛔`\n"
-                            f"• Short Trading: `ACTIVE ✅`"
+                            f"• Altcoin Longs: `LOCKED ⛔`\n"
+                            f"• Altcoin Shorts: `ACTIVE ✅`"
                         )
 
-                batch_prices = await asyncio.to_thread(fetch_vision_batch_prices)
-                for sym, price in batch_prices.items():
-                    await self.handle_fast_tick(sym, price)
+                # 2. Stage 1: Fetch all 300+ Linear Tickers from Bybit
+                all_tickers = await asyncio.to_thread(bybit_client.fetch_all_linear_tickers)
+                valid_candidates = []
+                radar_items = []
 
+                for item in all_tickers:
+                    sym = item.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+
+                    last_price = float(item.get("lastPrice", 0.0) or 0.0)
+                    turnover_24h = float(item.get("turnover24h", 0.0) or 0.0)
+                    change_24h_pct = float(item.get("price24hPcnt", 0.0) or 0.0) * 100.0
+
+                    if last_price <= 0:
+                        continue
+
+                    # Update in-memory live price
+                    await self.handle_fast_tick(sym, last_price)
+
+                    # Filter for liquid coins ($5M+ 24h volume)
+                    if turnover_24h >= config.MIN_24H_TURNOVER_USDT:
+                        valid_candidates.append({
+                            "symbol": sym,
+                            "price": last_price,
+                            "turnover": turnover_24h,
+                            "change_pct": change_24h_pct,
+                            "trend": "UP" if change_24h_pct >= 0 else "DOWN"
+                        })
+                        radar_items.append({
+                            "symbol": sym,
+                            "price": last_price,
+                            "change_pct": round(change_24h_pct, 2)
+                        })
+
+                radar_items.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+                self.market_radar = radar_items[:15]
+
+                # Check Circuit Breaker
                 if self.engine.is_circuit_breaker_triggered():
                     if not self.circuit_breaker_alerted:
                         self.trading_enabled = False
@@ -208,37 +184,23 @@ class MultiTokenBot:
                             "🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!"
                         )
 
+                # 3. Stage 2: Deep Scan for Entry Setup on Top Movers
                 free_slots = self.engine.max_concurrent - len(self.engine.positions)
-                if self.trading_enabled and free_slots > 0 and len(self.latest_prices) > 0:
-                    pre_candidates = []
-                    for symbol, current_price in list(self.latest_prices.items()):
-                        if symbol in self.engine.positions:
-                            continue
-                        history = self.price_history.get(symbol, [])
-                        if len(history) < 2:
-                            continue
-
-                        price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0
-                        trend = "UP" if history[-1] >= history[0] else "DOWN"
-                        pre_candidates.append({
-                            "symbol": symbol,
-                            "price": current_price,
-                            "trend": trend,
-                            "change_pct": price_change_pct
-                        })
-
-                    pre_candidates.sort(key=lambda x: x["change_pct"], reverse=True)
+                if self.trading_enabled and free_slots > 0 and valid_candidates:
+                    valid_candidates.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+                    top_pool = valid_candidates[:25]  # Deep scan top 25 momentum movers
 
                     verified_picks = []
-                    for cand in pre_candidates[:20]:
+                    for cand in top_pool:
                         sym = cand["symbol"]
-                        bin_sym = TOP_50_MAP.get(sym, "BTCUSDT")
+                        if sym in self.engine.positions:
+                            continue
 
                         signal, atr_val, vol_ratio, macro_trend = await asyncio.to_thread(
                             strategy_agent.evaluate_market_with_atr,
+                            sym,
                             cand["trend"],
-                            cand["price"],
-                            bin_sym
+                            cand["price"]
                         )
 
                         if signal == "LONG" and not self.btc_regime.get("allow_long", True):
@@ -246,7 +208,7 @@ class MultiTokenBot:
 
                         if signal in ["LONG", "SHORT"]:
                             vol_bonus = min(30.0, (vol_ratio - 1.0) * 20.0)
-                            score = round((cand["change_pct"] * 40.0) + 60.0 + vol_bonus, 1)
+                            score = round((abs(cand["change_pct"]) * 3.0) + 60.0 + vol_bonus, 1)
                             verified_picks.append({
                                 "symbol": sym,
                                 "signal": signal,
@@ -301,11 +263,11 @@ class MultiTokenBot:
                             conviction_badge = "🔥 High (2.5%)" if score >= 90 else ("⚡ Standard (2.0%)" if score >= 75 else "⚠️ Baseline (1.5%)")
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Dynamic Sized " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Bybit V5 300+ Scanner: " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
                                 "• BTC Regime: `" + self.btc_regime.get("regime", "STABLE") + " 🛡️`\n"
                                 "• Conviction: `" + conviction_badge + "`\n"
-                                "• Margin: `$" + f"{margin_amount:.2f}" + "`\n"
+                                "• Allocated Margin: `$" + f"{margin_amount:.2f}" + "`\n"
                                 "• Exposure: `" + str(long_count) + "L / " + str(short_count) + "S (Cap: 3)` ⚖️\n"
                                 "• Macro Alignment: `" + m_trend + " + 15m " + sig + "` 🧭\n"
                                 "• Volume Spike: `" + f"{v_ratio:.2f}x" + " Avg Vol` 🔥\n"
@@ -318,9 +280,9 @@ class MultiTokenBot:
                             await asyncio.to_thread(send_telegram_alert, alert_msg)
 
             except Exception as e:
-                print("[Klines Scanner Error]:", e)
+                print("[Bybit Scanner Error]:", e)
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
 
     async def telegram_command_listener(self):
         if not BOT_TOKEN:
@@ -364,17 +326,15 @@ class MultiTokenBot:
                             pos_text = "\n".join(active_desc) if active_desc else "None (0/5 Active Slots)"
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
-                            ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
                             regime_icon = "🟢" if self.btc_regime.get("regime") == "STABLE" else "🚨"
                             status_reply = (
-                                "📊 *Chama Capital Management Bot Status:*\n"
+                                "📊 *Chama Capital Management - Bybit Terminal Status:*\n"
                                 "• Engine State: " + state_str + "\n"
+                                "• Exchange Feed: `Bybit V5 Linear (300+ Pairs)` ⚡\n"
                                 "• Database: `" + ("Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite") + "` 🗄️\n"
                                 "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + "`\n"
-                                "• Zombie Killer: `Active (3h Stagnant Filter)` 🧟\n"
-                                "• Stream Feed: " + ws_str + "\n"
                                 "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
-                                "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
+                                "• Live Tracked Coins: " + str(len(self.latest_prices)) + " Bybit Perpetual Pairs\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
                                 "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
                                 "• Active Slots: " + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "\n"
@@ -394,7 +354,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* Quant Engine active."
+                                "▶️ *Trading Resumed!* Bybit 300+ Quant Engine active."
                             )
 
                         elif text == "/closeall":
@@ -418,14 +378,14 @@ class MultiTokenBot:
         db_type = "Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite"
         await asyncio.to_thread(
             send_telegram_alert,
-            f"🚀 *Upgrade 4 Complete: Cloud Database Persistence Online!*\n"
-            f"• Persistence Engine: `{db_type}` 🗄️\n"
-            f"• Crash Guard & Zombie Killer: Fully Armed 🛡️🧟\n"
-            f"• Historical PnL & Win Rate: Safely Preserved Across Redeploys"
+            f"🚀 *Bybit V5 Quant Engine Online (All 300+ Pairs Scanner)!* ⚡\n"
+            f"• Exchange: `Bybit V5 Linear Perpetuals`\n"
+            f"• Scanner: `300+ Pairs 2-Stage Filter ($5M+ Vol)` 🌐\n"
+            f"• Persistence: `{db_type}` 🗄️\n"
+            f"• BTC Crash Guard & Zombie Killer: Fully Armed 🛡️🧟"
         )
         await asyncio.gather(
-            self.websocket_stream_listener(),
-            self.klines_entry_scanner_loop(),
+            self.bybit_scanner_and_trading_loop(),
             self.telegram_command_listener()
         )
 
