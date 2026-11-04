@@ -15,7 +15,7 @@ bot_instance = MultiTokenBot()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
-    print("[Dashboard Server] Launching MultiTokenBot background engine...")
+    print("[Dashboard Server] Launching MultiTokenBot Bybit engine...")
     bot_task = asyncio.create_task(bot_instance.run_parallel_trading())
     yield
     bot_instance.is_running = False
@@ -123,17 +123,6 @@ async def get_metrics():
 
         sharpe_ratio = 2.45 if total_closed >= 5 and win_rate >= 60 else (1.65 if total_closed > 0 else 0.0)
 
-        radar_list = []
-        for sym, hist in bot_instance.price_history.items():
-            if len(hist) >= 2:
-                change = ((hist[-1] - hist[0]) / hist[0]) * 100.0
-                radar_list.append({
-                    "symbol": sym,
-                    "price": hist[-1],
-                    "change_pct": round(change, 2)
-                })
-        radar_list.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
-
         return {
             "starting_capital": starting_capital,
             "total_equity": total_equity,
@@ -151,10 +140,11 @@ async def get_metrics():
             "trading_enabled": bot_instance.trading_enabled,
             "btc_regime": bot_instance.btc_regime,
             "database_engine": "Cloud PostgreSQL" if database.is_postgres else "Local SQLite",
+            "tracked_count": len(bot_instance.latest_prices),
             "long_count": long_count,
             "short_count": short_count,
             "positions": positions_list,
-            "radar": radar_list[:10]
+            "radar": bot_instance.market_radar[:12]
         }
     except Exception as e:
         return {"error": str(e)}
@@ -191,7 +181,7 @@ CHAMA_DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CHAMA CAPITAL MANAGEMENT // Global Quant Terminal</title>
+    <title>CHAMA CAPITAL MANAGEMENT // Global Quant Terminal (Bybit Edition)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
     <style>
@@ -295,8 +285,8 @@ CHAMA_DASHBOARD_HTML = """
         <div class="modal-card">
             <div class="modal-header">
                 <div>
-                    <span id="modal-token-name" style="font-weight: 800; font-size: 19px; color: #fff;">BTC/USDC</span>
-                    <span style="font-size: 12px; color: var(--accent-orange); margin-left: 8px;">● Live Binance Perpetuals Feed</span>
+                    <span id="modal-token-name" style="font-weight: 800; font-size: 19px; color: #fff;">BTCUSDT</span>
+                    <span style="font-size: 12px; color: var(--accent-orange); margin-left: 8px;">● Bybit V5 Perpetual Live</span>
                 </div>
                 <button class="modal-close" onclick="closeChartModal()">&times;</button>
             </div>
@@ -304,13 +294,12 @@ CHAMA_DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Top Navigation Bar -->
     <div class="top-nav">
         <div class="brand-box">
-            <div class="brand-logo">CC</div>
+            <div class="brand-logo">BY</div>
             <div>
                 <div class="brand-title">CHAMA CAPITAL MANAGEMENT</div>
-                <div class="brand-sub">Global Discretionary Multi-Asset Futures Strategy</div>
+                <div class="brand-sub">Bybit V5 Linear 300+ Perpetuals Strategy</div>
             </div>
         </div>
         <div class="nav-links">
@@ -318,26 +307,25 @@ CHAMA_DASHBOARD_HTML = """
             <span class="nav-link">Asset Allocation</span>
             <span class="nav-link">Performance</span>
             <span class="nav-link">Risk Analytics</span>
-            <span class="nav-link">Reports (FY2026)</span>
+            <span class="nav-link">Bybit Linear (FY2026)</span>
         </div>
         <div class="market-status">
-            <div class="regime-pill" id="db-engine-pill">🗄️ DB: LOCAL SQLITE</div>
+            <div class="regime-pill" id="db-engine-pill">🗄️ SUPABASE CLOUD</div>
             <div class="regime-pill" id="btc-regime-pill">🛡️ BTC: STABLE</div>
             <div class="btn-group">
                 <button class="btn" onclick="controlBot('pause')">Pause</button>
                 <button class="btn btn-orange" onclick="controlBot('resume')">Resume</button>
                 <button class="btn" style="background:#7f1d1d; border-color:#991b1b;" onclick="controlBot('closeall')">Close All</button>
             </div>
-            <div class="status-pill" id="bot-status-pill">● MARKET OPEN // 10X PRO</div>
+            <div class="status-pill" id="bot-status-pill">● BYBIT 10X PRO</div>
         </div>
     </div>
 
-    <!-- Executive Header Banner -->
     <div class="exec-header">
         <div>
             <div class="exec-label">Net Asset Value (AUM)</div>
             <div class="exec-main-val" id="total-equity">$1,000.00</div>
-            <div class="exec-sub">Binance Vision WSS + Multi-Timeframe Trend</div>
+            <div class="exec-sub" id="exec-sub-text">Bybit V5 Real-Time Engine (Scanning 300+ Pairs)</div>
         </div>
         <div class="exec-stat-box">
             <div class="exec-label">Sharpe Ratio</div>
@@ -361,7 +349,6 @@ CHAMA_DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Secondary Metrics Grid with Cloud DB Persistence -->
     <div class="metrics-grid">
         <div class="metric-card">
             <div class="metric-title">Available Cash</div>
@@ -372,8 +359,8 @@ CHAMA_DASHBOARD_HTML = """
             <div class="metric-val" id="active-slots">0 / 5</div>
         </div>
         <div class="metric-card">
-            <div class="metric-title">Cloud Persistence</div>
-            <div class="metric-val" id="db-state-lbl" style="color:var(--accent-cyan); font-size: 15px; margin-top: 4px;">🗄️ Synced</div>
+            <div class="metric-title">Bybit Universe</div>
+            <div class="metric-val" id="tracked-coins-val" style="color:var(--accent-cyan); font-size: 18px; margin-top: 4px;">300+ Pairs</div>
         </div>
         <div class="metric-card">
             <div class="metric-title">Risk Model</div>
@@ -381,13 +368,12 @@ CHAMA_DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Main Grid Layout -->
     <div class="main-grid">
         <div>
             <div class="panel">
                 <div class="panel-header">
-                    <span>Active Portfolio Holdings (Click card for Real TradingView Chart)</span>
-                    <span style="font-size:10px; color:var(--accent-cyan);">WSS Synchronized</span>
+                    <span>Active Portfolio Holdings (Click card for Live Bybit Chart)</span>
+                    <span style="font-size:10px; color:var(--accent-cyan);">Bybit Linear V5 Feed</span>
                 </div>
                 <div class="positions-grid" id="active-positions-container">
                     <div style="color: var(--text-muted); font-size: 13px; font-style: italic;">No active positions open right now...</div>
@@ -411,9 +397,9 @@ CHAMA_DASHBOARD_HTML = """
 
         <div>
             <div class="panel">
-                <div class="panel-header"><span>Market Scanner Radar (Top 10)</span></div>
+                <div class="panel-header"><span>Bybit Top Movers Scanner (Turnover > $5M)</span></div>
                 <div class="radar-box" id="radar-container">
-                    <div style="color: var(--text-muted); font-size: 12px; font-style: italic;">Scanning top 50 perpetual assets...</div>
+                    <div style="color: var(--text-muted); font-size: 12px; font-style: italic;">Scanning Bybit perpetual universe...</div>
                 </div>
             </div>
         </div>
@@ -486,8 +472,8 @@ CHAMA_DASHBOARD_HTML = """
         });
 
         function openChartModal(symbol) {
-            const rawCoin = symbol.split('/')[0].toUpperCase();
-            const binanceSymbol = rawCoin === 'MATIC' ? 'BINANCE:POLUSDT.P' : ('BINANCE:' + rawCoin + 'USDT.P');
+            const cleanSym = symbol.replace('/', '').toUpperCase();
+            const bybitSym = 'BYBIT:' + cleanSym + '.P';
 
             document.getElementById('modal-token-name').textContent = symbol;
             document.getElementById('chart-modal').style.display = 'flex';
@@ -497,7 +483,7 @@ CHAMA_DASHBOARD_HTML = """
             
             new TradingView.widget({
                 "autosize": true,
-                "symbol": binanceSymbol,
+                "symbol": bybitSym,
                 "interval": "15",
                 "timezone": "Etc/UTC",
                 "theme": "dark",
@@ -555,12 +541,13 @@ CHAMA_DASHBOARD_HTML = """
                     document.getElementById('exposure-balance').textContent = m.long_count + 'L / ' + m.short_count + 'S';
                     document.getElementById('active-slots').textContent = m.active_positions_count + ' / ' + m.max_concurrent;
 
-                    // Update Database Persistence Pill
+                    if (m.tracked_count) {
+                        document.getElementById('tracked-coins-val').textContent = m.tracked_count + ' Coins Live';
+                    }
+
                     const dbPill = document.getElementById('db-engine-pill');
-                    const dbLbl = document.getElementById('db-state-lbl');
                     if (m.database_engine) {
                         dbPill.textContent = '🗄️ ' + m.database_engine.toUpperCase();
-                        dbLbl.textContent = m.database_engine.includes('Postgres') ? '🗄️ Supabase Cloud' : '📁 Local SQLite';
                     }
 
                     const rPill = document.getElementById('btc-regime-pill');
@@ -577,7 +564,7 @@ CHAMA_DASHBOARD_HTML = """
 
                     const pill = document.getElementById('bot-status-pill');
                     if (m.trading_enabled) {
-                        pill.textContent = '● MARKET OPEN // 10X PRO';
+                        pill.textContent = '● BYBIT 10X PRO';
                         pill.className = 'status-pill';
                     } else {
                         pill.textContent = '⏸️ TRADING PAUSED';
@@ -609,7 +596,7 @@ CHAMA_DASHBOARD_HTML = """
                                     <span class="${pnlClass}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl.toFixed(2)} (${p.roe_pct >= 0 ? '+' : ''}${p.roe_pct.toFixed(1)}%)</span>
                                 </div>
                                 <div class="pos-info"><span>Entry Price:</span><span class="pos-num">$${p.entry_price.toFixed(5)}</span></div>
-                                <div class="pos-info"><span>Live WSS Price:</span><span class="pos-num" style="color:var(--accent-cyan);">$${p.current_price.toFixed(5)}</span></div>
+                                <div class="pos-info"><span>Live Bybit Price:</span><span class="pos-num" style="color:var(--accent-cyan);">$${p.current_price.toFixed(5)}</span></div>
                                 <div class="pos-info"><span>Age / Time:</span><span class="pos-num" style="color:#f59e0b;">⏳ ${p.age_str}</span></div>
                                 <div class="pos-info"><span>Stop-Loss / Liq:</span><span class="pos-num" style="color:var(--accent-red);">$${p.sl_price.toFixed(5)}</span></div>
                                 <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${p.progress_pct}%;"></div></div>
