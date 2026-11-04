@@ -1,5 +1,4 @@
 import asyncio
-import sqlite3
 import os
 import json
 import requests
@@ -8,10 +7,10 @@ from datetime import datetime
 import config
 import risk_manager
 import strategy_agent
+import database
 from paper_engine import PaperTradingEngine
 from telegram_alerts import send_telegram_alert
 
-DB_PATH = os.environ.get("TRADING_BOT_DB", "trading_bot.db")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -64,20 +63,6 @@ def fetch_vision_batch_prices() -> dict:
     return prices
 
 
-def record_trade_db(token_symbol, action, amount, entry_price, exit_price=None, pnl=0.0, status="OPEN"):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO trades (token_symbol, action, amount, entry_price, exit_price, pnl, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (token_symbol, action, amount, entry_price, exit_price, pnl, status))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[DB Error]:", e)
-
-
 class MultiTokenBot:
     def __init__(self):
         self.engine = PaperTradingEngine(
@@ -110,7 +95,7 @@ class MultiTokenBot:
 
                 if event_type == "PARTIAL":
                     await asyncio.to_thread(
-                        record_trade_db,
+                        database.record_trade,
                         symbol,
                         "PARTIAL_50%_" + side_name,
                         event["closed_margin"],
@@ -134,7 +119,7 @@ class MultiTokenBot:
 
                 else:
                     await asyncio.to_thread(
-                        record_trade_db,
+                        database.record_trade,
                         symbol,
                         "CLOSE_" + side_name,
                         event["margin"],
@@ -144,7 +129,6 @@ class MultiTokenBot:
                         "CLOSED"
                     )
 
-                    # Distinguish between normal exit and Zombie Stagnant Killer
                     is_zombie = "Zombie" in str(event.get("reason", ""))
                     header_icon = "🧟 *Zombie Trade Killer (Slot Freed!)*" if is_zombie else "🏁 *Real-Time Exit (Slot Freed!)*"
 
@@ -195,7 +179,6 @@ class MultiTokenBot:
     async def klines_entry_scanner_loop(self):
         while self.is_running:
             try:
-                # 1. Update BTC Market Regime Filter
                 regime_data = await asyncio.to_thread(strategy_agent.check_btc_market_regime)
                 self.btc_regime = regime_data
 
@@ -212,7 +195,6 @@ class MultiTokenBot:
                             f"• Short Trading: `ACTIVE ✅`"
                         )
 
-                # 2. Sync batch prices
                 batch_prices = await asyncio.to_thread(fetch_vision_batch_prices)
                 for sym, price in batch_prices.items():
                     await self.handle_fast_tick(sym, price)
@@ -303,7 +285,7 @@ class MultiTokenBot:
                             sl_p = pos.get("sl_price", entry_p)
 
                             await asyncio.to_thread(
-                                record_trade_db,
+                                database.record_trade,
                                 sym,
                                 sig + "_" + str(self.engine.leverage) + "X",
                                 margin_amount,
@@ -387,6 +369,7 @@ class MultiTokenBot:
                             status_reply = (
                                 "📊 *Chama Capital Management Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
+                                "• Database: `" + ("Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite") + "` 🗄️\n"
                                 "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + "`\n"
                                 "• Zombie Killer: `Active (3h Stagnant Filter)` 🧟\n"
                                 "• Stream Feed: " + ws_str + "\n"
@@ -432,13 +415,13 @@ class MultiTokenBot:
             await asyncio.sleep(2)
 
     async def run_parallel_trading(self):
+        db_type = "Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite"
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Upgrade 3 Complete: Time-Based Stagnant Trade Killer Online!*\n"
-            "• Zombie Filter: Auto-closes trades stagnant > 3 hours (within ±0.35%) 🧟\n"
-            "• Slot Optimization: Reclaims idle capital for top momentum movers\n"
-            "• Runner Immunity: Risk-free runner trades protected\n"
-            "• BTC Crash Guard & Dynamic Sizing active"
+            f"🚀 *Upgrade 4 Complete: Cloud Database Persistence Online!*\n"
+            f"• Persistence Engine: `{db_type}` 🗄️\n"
+            f"• Crash Guard & Zombie Killer: Fully Armed 🛡️🧟\n"
+            f"• Historical PnL & Win Rate: Safely Preserved Across Redeploys"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
