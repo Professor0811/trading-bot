@@ -99,7 +99,6 @@ class MultiTokenBot:
             if len(history) > 30:
                 history.pop(0)
 
-        # Millisecond Exit Evaluation (Instant TP / Dynamic ATR SL)
         if symbol in self.engine.positions:
             closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
             if closed:
@@ -196,13 +195,13 @@ class MultiTokenBot:
 
                     pre_candidates.sort(key=lambda x: x["change_pct"], reverse=True)
 
-                    # Evaluate top movers using 15m Klines + Dynamic ATR
+                    # Evaluate top movers using 15m Klines + Volume Spike Filter + Dynamic ATR
                     verified_picks = []
-                    for cand in pre_candidates[:15]:
+                    for cand in pre_candidates[:20]:
                         sym = cand["symbol"]
                         bin_sym = TOP_50_MAP.get(sym, "BTCUSDT")
 
-                        signal, atr_val = await asyncio.to_thread(
+                        signal, atr_val, vol_ratio = await asyncio.to_thread(
                             strategy_agent.evaluate_market_with_atr,
                             cand["trend"],
                             cand["price"],
@@ -210,24 +209,29 @@ class MultiTokenBot:
                         )
 
                         if signal in ["LONG", "SHORT"]:
-                            score = round((cand["change_pct"] * 50.0) + 60.0, 1)
+                            # Boost Conviction Score using Volume Spike multiplier
+                            vol_bonus = min(30.0, (vol_ratio - 1.0) * 20.0)
+                            score = round((cand["change_pct"] * 40.0) + 55.0 + vol_bonus, 1)
                             verified_picks.append({
                                 "symbol": sym,
                                 "signal": signal,
                                 "price": cand["price"],
                                 "score": score,
-                                "atr": atr_val
+                                "atr": atr_val,
+                                "vol_ratio": vol_ratio
                             })
                             if len(verified_picks) >= free_slots:
                                 break
 
-                    # Open position with Dynamic ATR
+                    verified_picks.sort(key=lambda x: x["score"], reverse=True)
+
                     for pick in verified_picks[:free_slots]:
                         sym = pick["symbol"]
                         sig = pick["signal"]
                         cur_p = pick["price"]
                         score = pick["score"]
                         atr = pick["atr"]
+                        v_ratio = pick["vol_ratio"]
 
                         margin_amount = self.engine.calculate_position_size()
                         order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p, custom_atr=atr)
@@ -238,7 +242,6 @@ class MultiTokenBot:
                             tp_p = pos.get("tp_price", entry_p)
                             sl_p = pos.get("sl_price", entry_p)
                             liq_p = pos.get("liq_price", entry_p)
-                            leveraged_size = pos.get("leveraged_size", margin_amount * self.engine.leverage)
 
                             await asyncio.to_thread(
                                 record_trade_db,
@@ -253,9 +256,9 @@ class MultiTokenBot:
 
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *Dynamic ATR " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Volume-Verified " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
-                                "• Leverage: `" + str(self.engine.leverage) + "x Isolated`\n"
+                                "• Volume Spike: `" + f"{v_ratio:.2f}x" + " Avg Vol` 🔥\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
                                 "• Dynamic SL (1.5x ATR): `$" + fmt_p(sl_p) + "`\n"
                                 "• Dynamic TP (3.0x ATR): `$" + fmt_p(tp_p) + "`\n"
@@ -307,7 +310,7 @@ class MultiTokenBot:
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
                             status_reply = (
-                                "📊 *Professional Dynamic ATR Bot Status:*\n"
+                                "📊 *Volume-Verified ATR Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Stream Feed: " + ws_str + "\n"
                                 "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
@@ -330,7 +333,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* Dynamic ATR Engine active."
+                                "▶️ *Trading Resumed!* Volume-Verified Engine active."
                             )
 
                         elif text == "/closeall":
@@ -354,10 +357,9 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Institutional-Grade Dynamic ATR Futures Bot Online!*\n"
-            "• Stream: Millisecond Binance Vision WSS\n"
-            "• Strategy: 15m Klines + Wilder's RSI + EMA 20/50\n"
-            "• Risk: Dynamic ATR SL (1.5x) & TP (3.0x)\n"
+            "🚀 *Upgrade 1 Complete: Volume-Spike Filter Online!*\n"
+            "• Fakeout Filter: Requires Volume >= 1.10x of 20-SMA\n"
+            "• Core: 15m Klines + Wilder's RSI + EMA + Dynamic ATR\n"
             "• Capacity: 5 Slots (10x Isolated Margin)"
         )
         await asyncio.gather(
