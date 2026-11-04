@@ -1,91 +1,70 @@
-from datetime import datetime
 import config
 
-class PaperTradingEngine:
-    def __init__(self, initial_capital: float = 1000.0, max_concurrent: int = 3):
-        self.cash_balance = initial_capital
-        self.initial_capital = initial_capital
-        self.max_concurrent = max_concurrent
-        self.leverage = getattr(config, "LEVERAGE", 5)
-        # Positions dict: {"SOL/USDC": {...}, ...}
-        self.positions = {}
-        self.realized_pnl = 0.0
-        self.day_start_balance = initial_capital
 
-    @property
-    def active_position(self):
-        if self.positions:
-            return next(iter(self.positions.values()))
-        return None
+class PaperTradingEngine:
+    def __init__(self, initial_capital=1000.0, max_concurrent=5):
+        self.initial_capital = initial_capital
+        self.cash_balance = initial_capital
+        self.realized_pnl = 0.0
+        self.max_concurrent = max_concurrent
+        self.leverage = getattr(config, "LEVERAGE", 10)
+        self.positions = {}
+        self.daily_starting_capital = initial_capital
 
     def calculate_position_size(self) -> float:
-        """Returns 2% of current total equity as isolated margin collateral."""
-        current_equity = self.cash_balance + sum(p.get("margin", 0.0) for p in self.positions.values())
-        margin_size = current_equity * config.POSITION_MARGIN_PERCENT
-        return max(5.0, round(margin_size, 2))
-
-    def is_circuit_breaker_triggered(self) -> bool:
-        """Triggers if daily net loss hits 10% of day-start capital."""
-        current_equity = self.cash_balance + sum(p.get("margin", 0.0) for p in self.positions.values())
-        loss = self.day_start_balance - current_equity
-        max_allowed_loss = self.day_start_balance * config.DAILY_LOSS_LIMIT_PERCENT
-        return loss >= max_allowed_loss
+        """2% isolated margin per trade."""
+        total_equity = self.get_total_equity()
+        margin = total_equity * config.POSITION_MARGIN_PERCENT
+        return min(margin, self.cash_balance)
 
     def can_open_position(self, symbol: str) -> bool:
-        if len(self.positions) >= self.max_concurrent:
-            return False
         if symbol in self.positions:
             return False
-        if self.is_circuit_breaker_triggered():
+        if len(self.positions) >= self.max_concurrent:
+            return False
+        if self.cash_balance < (self.get_total_equity() * config.POSITION_MARGIN_PERCENT * 0.8):
             return False
         return True
 
-    def execute_order(self, symbol: str, side: str, margin: float, price: float):
-        """
-        Executes a 5x Leveraged Long or Short order using isolated margin.
-        side: 'LONG' (or 'BUY') / 'SHORT' (or 'SELL')
-        """
-        side = "LONG" if side in ["LONG", "BUY"] else "SHORT"
-
-        if not self.can_open_position(symbol):
+    def execute_order(self, symbol: str, side: str, margin: float, entry_price: float, custom_atr: float = None) -> bool:
+        if not self.can_open_position(symbol) or margin <= 0 or entry_price <= 0:
             return False
 
-        if self.cash_balance < margin:
-            return False
-
-        # Deduct margin from cash balance
-        self.cash_balance -= margin
         leveraged_size = margin * self.leverage
-        
-        # Deduct opening taker fee on total leveraged notional size
-        open_fee = leveraged_size * config.FUTURES_TAKER_FEE
-        self.cash_balance -= open_fee
+        fee = leveraged_size * config.FUTURES_TAKER_FEE
+        self.cash_balance -= (margin + fee)
 
-        # Calculate TP, SL, and Liquidation Prices based on direction
+        # Dynamic ATR Targets: SL = 1.5x ATR, TP = 3.0x ATR (1:2 R:R)
+        if custom_atr and custom_atr > 0:
+            sl_dist = custom_atr * 1.5
+            tp_dist = custom_atr * 3.0
+        else:
+            sl_dist = entry_price * config.STOP_LOSS_PERCENT
+            tp_dist = entry_price * config.TAKE_PROFIT_PERCENT
+
+        # Safe liquidation distance (approx 8.5% at 10x)
+        liq_distance = entry_price * ((1.0 / self.leverage) - config.MAINTENANCE_MARGIN_PERCENT)
+
         if side == "LONG":
-            tp_price = price * (1.0 + config.TAKE_PROFIT_PERCENT)
-            sl_price = price * (1.0 - config.STOP_LOSS_PERCENT)
-            # Long Liquidation: Price drops ~18.5%
-            liq_price = price * (1.0 - (1.0 / self.leverage - config.MAINTENANCE_MARGIN_PERCENT))
-            extreme_price = price
-        else:  # SHORT
-            tp_price = price * (1.0 - config.TAKE_PROFIT_PERCENT)
-            sl_price = price * (1.0 + config.STOP_LOSS_PERCENT)
-            # Short Liquidation: Price rises ~18.5%
-            liq_price = price * (1.0 + (1.0 / self.leverage - config.MAINTENANCE_MARGIN_PERCENT))
-            extreme_price = price
+            tp_price = entry_price + tp_dist
+            sl_price = max(entry_price - sl_dist, entry_price - liq_distance * 0.95)
+            liq_price = entry_price - liq_distance
+        else:
+            tp_price = max(0.00000001, entry_price - tp_dist)
+            sl_price = min(entry_price + sl_dist, entry_price + liq_distance * 0.95)
+            liq_price = entry_price + liq_distance
 
         self.positions[symbol] = {
-            "symbol": symbol,
             "side": side,
             "margin": margin,
             "leveraged_size": leveraged_size,
-            "entry_price": price,
+            "entry_price": entry_price,
             "tp_price": tp_price,
             "sl_price": sl_price,
             "liq_price": liq_price,
-            "extreme_price": extreme_price,  # Highest for Long, Lowest for Short
-            "open_fee": open_fee
+            "peak_price": entry_price,
+            "trailing_active": False,
+            "atr_used": custom_atr or (entry_price * 0.01)
         }
         return True
 
@@ -95,41 +74,39 @@ class PaperTradingEngine:
 
         pos = self.positions[symbol]
         side = pos["side"]
-        reason = None
+        entry = pos["entry_price"]
+        tp = pos["tp_price"]
+        sl = pos["sl_price"]
+        liq = pos["liq_price"]
+        trail_pct = config.TRAILING_STOP_PERCENT
 
-        # 1. Update Trailing Stop-Loss
+        # 1. Liquidation Check
+        if (side == "LONG" and current_price <= liq) or (side == "SHORT" and current_price >= liq):
+            return self._close_token_position(symbol, "Liquidation", liq)
+
+        # 2. Hard Stop-Loss Check
+        if (side == "LONG" and current_price <= sl) or (side == "SHORT" and current_price >= sl):
+            return self._close_token_position(symbol, "Dynamic ATR Stop-Loss", current_price)
+
+        # 3. Take-Profit & Trailing Stop Activation
         if side == "LONG":
-            if current_price > pos["extreme_price"]:
-                pos["extreme_price"] = current_price
-                new_sl = current_price * (1.0 - config.TRAILING_STOP_PERCENT)
-                if new_sl > pos["sl_price"]:
-                    pos["sl_price"] = new_sl
-
-            # Check Exit Triggers for LONG
-            if current_price <= pos["liq_price"]:
-                reason = "💥 LIQUIDATION HIT"
-            elif current_price >= pos["tp_price"]:
-                reason = "Take-Profit Hit 🎯 (+15% ROE)"
-            elif current_price <= pos["sl_price"]:
-                reason = "Stop-Loss / Trailing SL Hit 🛑"
-
-        else:  # SHORT
-            if current_price < pos["extreme_price"]:
-                pos["extreme_price"] = current_price
-                new_sl = current_price * (1.0 + config.TRAILING_STOP_PERCENT)
-                if new_sl < pos["sl_price"]:
-                    pos["sl_price"] = new_sl
-
-            # Check Exit Triggers for SHORT
-            if current_price >= pos["liq_price"]:
-                reason = "💥 LIQUIDATION HIT"
-            elif current_price <= pos["tp_price"]:
-                reason = "Take-Profit Hit 🎯 (+15% ROE)"
-            elif current_price >= pos["sl_price"]:
-                reason = "Stop-Loss / Trailing SL Hit 🛑"
-
-        if reason:
-            return self._close_token_position(symbol, reason, current_price)
+            if current_price >= tp:
+                pos["trailing_active"] = True
+            if current_price > pos["peak_price"]:
+                pos["peak_price"] = current_price
+            if pos["trailing_active"]:
+                trail_price = pos["peak_price"] * (1.0 - trail_pct)
+                if current_price <= trail_price:
+                    return self._close_token_position(symbol, "Trailing Take-Profit", current_price)
+        else:
+            if current_price <= tp:
+                pos["trailing_active"] = True
+            if current_price < pos["peak_price"]:
+                pos["peak_price"] = current_price
+            if pos["trailing_active"]:
+                trail_price = pos["peak_price"] * (1.0 + trail_pct)
+                if current_price >= trail_price:
+                    return self._close_token_position(symbol, "Trailing Take-Profit", current_price)
 
         return None
 
@@ -139,36 +116,39 @@ class PaperTradingEngine:
             return None
 
         side = pos["side"]
-        leveraged_size = pos["leveraged_size"]
-        entry_price = pos["entry_price"]
+        entry = pos["entry_price"]
         margin = pos["margin"]
+        exposure = pos["leveraged_size"]
 
-        # Calculate Gross PnL
-        if "LIQUIDATION" in reason:
-            pnl = -margin  # Isolated margin is completely wiped out
-            close_fee = 0.0
+        if reason == "Liquidation":
+            pnl = -margin
         else:
             if side == "LONG":
-                pnl = leveraged_size * ((exit_price - entry_price) / entry_price)
-            else:  # SHORT
-                pnl = leveraged_size * ((entry_price - exit_price) / entry_price)
-            
-            # Deduct closing taker fee
-            close_fee = leveraged_size * config.FUTURES_TAKER_FEE
-            pnl -= close_fee
+                pnl = (exit_price - entry) / entry * exposure
+            else:
+                pnl = (entry - exit_price) / entry * exposure
 
-        return_capital = max(0.0, margin + pnl)
-        self.cash_balance += return_capital
-        self.realized_pnl += pnl
+        close_fee = exposure * config.FUTURES_TAKER_FEE
+        net_pnl = pnl - close_fee
+        returned_cash = max(0.0, margin + net_pnl)
+
+        self.cash_balance += returned_cash
+        self.realized_pnl += net_pnl
 
         return {
             "symbol": symbol,
             "side": side,
-            "reason": reason,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
             "margin": margin,
-            "leveraged_size": leveraged_size,
-            "pnl": round(pnl, 2),
-            "wallet_cash": round(self.cash_balance, 2)
+            "entry_price": entry,
+            "exit_price": exit_price,
+            "pnl": net_pnl,
+            "reason": reason
         }
+
+    def get_total_equity(self) -> float:
+        return self.cash_balance + sum(p["margin"] for p in self.positions.values())
+
+    def is_circuit_breaker_triggered(self) -> bool:
+        total_equity = self.get_total_equity()
+        drawdown = (self.daily_starting_capital - total_equity) / self.daily_starting_capital
+        return drawdown >= config.DAILY_LOSS_LIMIT_PERCENT
