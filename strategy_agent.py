@@ -67,7 +67,7 @@ def calculate_atr(highs, lows, closes, period=14):
 def calculate_volume_ratio(volumes, period=20):
     """
     Compare recent candle volume against the 20-period Volume SMA.
-    Uses max of current forming candle and last closed candle to avoid early-minute bias.
+    Uses max of current forming candle and last closed candle.
     """
     if not volumes or len(volumes) < period + 2:
         return 1.2
