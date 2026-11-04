@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import config
 from multi_token_bot import MultiTokenBot
@@ -39,7 +39,6 @@ async def get_metrics():
         conn.close()
 
         starting_capital = getattr(config, "STARTING_CAPITAL", 1000.0)
-        # Margin per slot is 2% of capital ($20 per position)
         margin_per_slot = starting_capital * getattr(config, "POSITION_MARGIN_PERCENT", 0.02)
         locked_margin = open_count * margin_per_slot
         current_equity = starting_capital + realized_pnl
@@ -79,7 +78,6 @@ async def get_trades():
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
-    # Serve the trading dashboard frontend
     html_file = os.path.join(os.path.dirname(__file__), "dashboard.html")
     if os.path.exists(html_file):
         with open(html_file, "r", encoding="utf-8") as f:
