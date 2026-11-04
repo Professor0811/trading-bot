@@ -81,6 +81,7 @@ async def get_metrics():
             leveraged_size = p["leveraged_size"]
             tp = p["tp_price"]
             sl = p["sl_price"]
+            liq = p["liq_price"]
             partial_tp = p.get("partial_tp_price", tp)
 
             if side == "LONG":
@@ -109,6 +110,7 @@ async def get_metrics():
                 "be_active": p.get("partial_tp_done", False),
                 "sl_price": sl,
                 "tp_price": tp,
+                "liq_price": liq,
                 "partial_tp": partial_tp,
                 "progress_pct": round(progress_pct, 1)
             })
@@ -216,7 +218,7 @@ ULTIMATE_TERMINAL_HTML = """
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; flex-wrap: wrap; gap: 12px; }
         .title { font-size: 24px; font-weight: 800; background: linear-gradient(90deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         
-        .header-actions { display: flex; gap: 10px; align-items: center; }
+        .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
         .btn { background: #1e293b; color: #f8fafc; border: 1px solid #334155; padding: 8px 16px; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 12px; transition: all 0.2s; }
         .btn:hover { background: #334155; }
         .btn-pause { background: rgba(239, 68, 68, 0.2); color: #f87171; border-color: rgba(239, 68, 68, 0.4); }
@@ -226,11 +228,11 @@ ULTIMATE_TERMINAL_HTML = """
         .badge { background: rgba(16, 185, 129, 0.1); color: var(--accent-green); border: 1px solid rgba(16, 185, 129, 0.3); padding: 6px 14px; border-radius: 999px; font-size: 12px; font-weight: 700; }
         .badge-paused { background: rgba(239, 68, 68, 0.1); color: var(--accent-red); border: 1px solid rgba(239, 68, 68, 0.3); }
 
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .card { background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 14px; padding: 20px; position: relative; overflow: hidden; }
         .card::before { content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: var(--accent-cyan); }
         .card-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; font-weight: 600; }
-        .card-val { font-size: 26px; font-weight: 800; color: var(--text-main); }
+        .card-val { font-size: 24px; font-weight: 800; color: var(--text-main); }
 
         .dashboard-layout { display: grid; grid-template-columns: 3fr 1fr; gap: 24px; margin-bottom: 24px; }
         @media (max-width: 1024px) { .dashboard-layout { grid-template-columns: 1fr; } }
@@ -261,9 +263,17 @@ ULTIMATE_TERMINAL_HTML = """
         .tag-long { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
         .tag-short { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
         .shield-badge { background: #1e3a8a; color: #93c5fd; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+
+        /* Toast Popup Notification Style */
+        #toast { visibility: hidden; min-width: 250px; background-color: #1e293b; color: #fff; text-align: center; border-radius: 8px; padding: 12px; position: fixed; z-index: 1000; right: 30px; bottom: 30px; font-size: 14px; border: 1px solid #334155; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+        #toast.show { visibility: visible; animation: fadein 0.5s, fadeout 0.5s 2.5s; }
+        @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
+        @keyframes fadeout { from {bottom: 30px; opacity: 1;} to {bottom: 0; opacity: 0;} }
     </style>
 </head>
 <body>
+    <div id="toast">Command executed successfully!</div>
+
     <div class="header">
         <div class="title">⚡ WALL STREET QUANT TERMINAL // 10x Futures Pro</div>
         <div class="header-actions">
@@ -300,7 +310,7 @@ ULTIMATE_TERMINAL_HTML = """
     <div class="dashboard-layout">
         <div>
             <div class="panel">
-                <div class="panel-title">Active Live Positions & TP Progress Bars</div>
+                <div class="panel-title">Active Live Positions & SL / Liquidation Watch</div>
                 <div class="positions-grid" id="active-positions-container">
                     <div style="color: var(--text-muted); font-size: 13px; font-style: italic;">No active positions open right now...</div>
                 </div>
@@ -345,6 +355,13 @@ ULTIMATE_TERMINAL_HTML = """
         const equityData = { labels: [], datasets: [{ label: 'Portfolio Equity ($)', data: [], borderColor: '#06b6d4', backgroundColor: 'rgba(6, 182, 212, 0.08)', borderWidth: 2, fill: true, tension: 0.35 }] };
         const chart = new Chart(ctx, { type: 'line', data: equityData, options: { plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1e293b' } } } } });
 
+        function showToast(msg) {
+            const x = document.getElementById("toast");
+            x.textContent = msg;
+            x.className = "show";
+            setTimeout(() => { x.className = x.className.replace("show", ""); }, 3000);
+        }
+
         async function controlBot(action) {
             if(!confirm('Are you sure you want to execute action: ' + action.toUpperCase() + '?')) return;
             try {
@@ -354,9 +371,9 @@ ULTIMATE_TERMINAL_HTML = """
                     body: JSON.stringify({ action: action })
                 });
                 const data = await res.json();
-                alert('Command executed: ' + JSON.stringify(data));
+                showToast('Success: ' + action.toUpperCase() + ' command sent!');
                 refreshData();
-            } catch(e) { alert('Error: ' + e); }
+            } catch(e) { showToast('Error: ' + e); }
         }
 
         async function refreshData() {
@@ -400,6 +417,8 @@ ULTIMATE_TERMINAL_HTML = """
                                 </div>
                                 <div class="pos-row"><span>Entry Price:</span><span class="pos-val">$${p.entry_price.toFixed(5)}</span></div>
                                 <div class="pos-row"><span>Live WSS Price:</span><span class="pos-val" style="color: #38bdf8;">$${p.current_price.toFixed(5)}</span></div>
+                                <div class="pos-row"><span>Stop-Loss (SL):</span><span class="pos-val" style="color: #ef4444;">$${p.sl_price.toFixed(5)}</span></div>
+                                <div class="pos-row"><span>Est. Liq Price:</span><span class="pos-val" style="color: #f59e0b;">$${p.liq_price.toFixed(5)}</span></div>
                                 <div class="pos-row"><span>Target TP:</span><span class="pos-val">$${p.tp_price.toFixed(5)}</span></div>
                                 <div class="progress-container">
                                     <div class="progress-bar" style="width: ${p.progress_pct}%;"></div>
