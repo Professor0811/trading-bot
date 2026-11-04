@@ -21,5 +21,6 @@ TRAILING_STOP_PERCENT = 0.008
 FUTURES_TAKER_FEE = 0.00055
 MAINTENANCE_MARGIN_PERCENT = 0.005
 
-# Scanner Rules
-MIN_24H_TURNOVER_USDT = 5000000.0  # Min $5M 24h Volume to filter illiquid coins
+# Scanner & Liquidity Rules (Both names supported for backward compatibility)
+MIN_LIQUIDITY_USD = 5000000.0
+MIN_24H_TURNOVER_USDT = 5000000.0
