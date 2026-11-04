@@ -34,22 +34,25 @@ class PaperTradingEngine:
         fee = leveraged_size * config.FUTURES_TAKER_FEE
         self.cash_balance -= (margin + fee)
 
-        # Dynamic ATR Targets: SL = 1.5x ATR, TP = 3.0x ATR (1:2 R:R)
+        # Dynamic ATR Targets: Partial TP = 1.5x ATR, Full TP = 3.0x ATR, SL = 1.5x ATR
         if custom_atr and custom_atr > 0:
             sl_dist = custom_atr * 1.5
+            partial_tp_dist = custom_atr * 1.5
             tp_dist = custom_atr * 3.0
         else:
             sl_dist = entry_price * config.STOP_LOSS_PERCENT
+            partial_tp_dist = entry_price * (config.TAKE_PROFIT_PERCENT * 0.5)
             tp_dist = entry_price * config.TAKE_PROFIT_PERCENT
 
-        # Safe liquidation distance (approx 8.5% at 10x)
         liq_distance = entry_price * ((1.0 / self.leverage) - config.MAINTENANCE_MARGIN_PERCENT)
 
         if side == "LONG":
+            partial_tp_price = entry_price + partial_tp_dist
             tp_price = entry_price + tp_dist
             sl_price = max(entry_price - sl_dist, entry_price - liq_distance * 0.95)
             liq_price = entry_price - liq_distance
         else:
+            partial_tp_price = max(0.00000001, entry_price - partial_tp_dist)
             tp_price = max(0.00000001, entry_price - tp_dist)
             sl_price = min(entry_price + sl_dist, entry_price + liq_distance * 0.95)
             liq_price = entry_price + liq_distance
@@ -59,11 +62,13 @@ class PaperTradingEngine:
             "margin": margin,
             "leveraged_size": leveraged_size,
             "entry_price": entry_price,
+            "partial_tp_price": partial_tp_price,
             "tp_price": tp_price,
             "sl_price": sl_price,
             "liq_price": liq_price,
             "peak_price": entry_price,
             "trailing_active": False,
+            "partial_tp_done": False,
             "atr_used": custom_atr or (entry_price * 0.01)
         }
         return True
@@ -75,6 +80,7 @@ class PaperTradingEngine:
         pos = self.positions[symbol]
         side = pos["side"]
         entry = pos["entry_price"]
+        partial_tp = pos.get("partial_tp_price", pos["tp_price"])
         tp = pos["tp_price"]
         sl = pos["sl_price"]
         liq = pos["liq_price"]
@@ -84,11 +90,17 @@ class PaperTradingEngine:
         if (side == "LONG" and current_price <= liq) or (side == "SHORT" and current_price >= liq):
             return self._close_token_position(symbol, "Liquidation", liq)
 
-        # 2. Hard Stop-Loss Check
+        # 2. Hard Stop-Loss / Break-Even Stop Check
         if (side == "LONG" and current_price <= sl) or (side == "SHORT" and current_price >= sl):
-            return self._close_token_position(symbol, "Dynamic ATR Stop-Loss", current_price)
+            reason_label = "Break-Even Stop (Risk-Free)" if pos.get("partial_tp_done") else "Dynamic ATR Stop-Loss"
+            return self._close_token_position(symbol, reason_label, current_price)
 
-        # 3. Take-Profit & Trailing Stop Activation
+        # 3. Auto Break-Even & 50% Partial Take-Profit at +1.5x ATR
+        if not pos.get("partial_tp_done", False):
+            if (side == "LONG" and current_price >= partial_tp) or (side == "SHORT" and current_price <= partial_tp):
+                return self._scale_out_half_position(symbol, current_price)
+
+        # 4. Full Take-Profit (3.0x ATR) & Trailing Stop Activation
         if side == "LONG":
             if current_price >= tp:
                 pos["trailing_active"] = True
@@ -97,7 +109,7 @@ class PaperTradingEngine:
             if pos["trailing_active"]:
                 trail_price = pos["peak_price"] * (1.0 - trail_pct)
                 if current_price <= trail_price:
-                    return self._close_token_position(symbol, "Trailing Take-Profit", current_price)
+                    return self._close_token_position(symbol, "Trailing Full Take-Profit", current_price)
         else:
             if current_price <= tp:
                 pos["trailing_active"] = True
@@ -106,9 +118,54 @@ class PaperTradingEngine:
             if pos["trailing_active"]:
                 trail_price = pos["peak_price"] * (1.0 + trail_pct)
                 if current_price >= trail_price:
-                    return self._close_token_position(symbol, "Trailing Take-Profit", current_price)
+                    return self._close_token_position(symbol, "Trailing Full Take-Profit", current_price)
 
         return None
+
+    def _scale_out_half_position(self, symbol: str, current_price: float):
+        """Closes 50% of the position at 1.5x ATR and moves Stop-Loss to Break-Even."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return None
+
+        side = pos["side"]
+        entry = pos["entry_price"]
+        half_margin = pos["margin"] * 0.5
+        half_exposure = pos["leveraged_size"] * 0.5
+
+        if side == "LONG":
+            pnl = (current_price - entry) / entry * half_exposure
+            # Move SL slightly above entry (+0.12%) to cover taker fees
+            new_be_sl = entry * 1.0012
+        else:
+            pnl = (entry - current_price) / entry * half_exposure
+            new_be_sl = entry * 0.9988
+
+        close_fee = half_exposure * config.FUTURES_TAKER_FEE
+        net_pnl = pnl - close_fee
+        returned_cash = max(0.0, half_margin + net_pnl)
+
+        # Update wallet and remaining 50% position state
+        self.cash_balance += returned_cash
+        self.realized_pnl += net_pnl
+
+        pos["margin"] -= half_margin
+        pos["leveraged_size"] -= half_exposure
+        pos["sl_price"] = new_be_sl
+        pos["partial_tp_done"] = True
+
+        return {
+            "event_type": "PARTIAL",
+            "symbol": symbol,
+            "side": side,
+            "closed_margin": half_margin,
+            "remaining_margin": pos["margin"],
+            "entry_price": entry,
+            "exit_price": current_price,
+            "new_sl_price": new_be_sl,
+            "pnl": net_pnl,
+            "reason": "50% Partial TP (1.5x ATR) + Auto Break-Even"
+        }
 
     def _close_token_position(self, symbol: str, reason: str, exit_price: float):
         pos = self.positions.pop(symbol, None)
@@ -136,6 +193,7 @@ class PaperTradingEngine:
         self.realized_pnl += net_pnl
 
         return {
+            "event_type": "FULL",
             "symbol": symbol,
             "side": side,
             "margin": margin,
