@@ -2,11 +2,12 @@ import config
 
 
 class PaperTradingEngine:
-    def __init__(self, initial_capital=1000.0, max_concurrent=5):
+    def __init__(self, initial_capital=1000.0, max_concurrent=5, max_same_side=3):
         self.initial_capital = initial_capital
         self.cash_balance = initial_capital
         self.realized_pnl = 0.0
         self.max_concurrent = max_concurrent
+        self.max_same_side = max_same_side  # Maximum 3 LONGs or 3 SHORTs concurrently
         self.leverage = getattr(config, "LEVERAGE", 10)
         self.positions = {}
         self.daily_starting_capital = initial_capital
@@ -17,17 +18,24 @@ class PaperTradingEngine:
         margin = total_equity * config.POSITION_MARGIN_PERCENT
         return min(margin, self.cash_balance)
 
-    def can_open_position(self, symbol: str) -> bool:
+    def can_open_position(self, symbol: str, side: str = None) -> bool:
         if symbol in self.positions:
             return False
         if len(self.positions) >= self.max_concurrent:
             return False
         if self.cash_balance < (self.get_total_equity() * config.POSITION_MARGIN_PERCENT * 0.8):
             return False
+
+        # Directional Exposure Cap: Limit concurrent positions on the same side
+        if side:
+            current_side_count = sum(1 for p in self.positions.values() if p.get("side") == side)
+            if current_side_count >= self.max_same_side:
+                return False
+
         return True
 
     def execute_order(self, symbol: str, side: str, margin: float, entry_price: float, custom_atr: float = None) -> bool:
-        if not self.can_open_position(symbol) or margin <= 0 or entry_price <= 0:
+        if not self.can_open_position(symbol, side=side) or margin <= 0 or entry_price <= 0:
             return False
 
         leveraged_size = margin * self.leverage
@@ -123,7 +131,6 @@ class PaperTradingEngine:
         return None
 
     def _scale_out_half_position(self, symbol: str, current_price: float):
-        """Closes 50% of the position at 1.5x ATR and moves Stop-Loss to Break-Even."""
         pos = self.positions.get(symbol)
         if not pos:
             return None
@@ -135,7 +142,6 @@ class PaperTradingEngine:
 
         if side == "LONG":
             pnl = (current_price - entry) / entry * half_exposure
-            # Move SL slightly above entry (+0.12%) to cover taker fees
             new_be_sl = entry * 1.0012
         else:
             pnl = (entry - current_price) / entry * half_exposure
@@ -145,7 +151,6 @@ class PaperTradingEngine:
         net_pnl = pnl - close_fee
         returned_cash = max(0.0, half_margin + net_pnl)
 
-        # Update wallet and remaining 50% position state
         self.cash_balance += returned_cash
         self.realized_pnl += net_pnl
 
