@@ -2,21 +2,20 @@ import time
 import requests
 import numpy as np
 
-# In-memory cache to prevent API rate-limiting and event loop blocking
 _KLINE_CACHE = {}
 CACHE_TTL = 60  # Cache 15m klines for 60 seconds per symbol
 
 
-def fetch_klines(binance_symbol: str, interval="15m", limit=55):
+def fetch_full_klines(binance_symbol: str, interval="15m", limit=55):
     """
-    Fetch real OHLCV klines from Binance Vision API (US-friendly, no geo-block)
-    with a 60-second smart cache.
+    Fetch full OHLCV klines (High, Low, Close) from Binance Vision API.
+    Returns dict with 'high', 'low', 'close' lists or None.
     """
     now = time.time()
     if binance_symbol in _KLINE_CACHE:
-        cached_time, cached_closes = _KLINE_CACHE[binance_symbol]
+        cached_time, cached_data = _KLINE_CACHE[binance_symbol]
         if now - cached_time < CACHE_TTL:
-            return cached_closes
+            return cached_data
 
     urls = [
         f"https://data-api.binance.vision/api/v3/klines?symbol={binance_symbol}&interval={interval}&limit={limit}",
@@ -28,16 +27,41 @@ def fetch_klines(binance_symbol: str, interval="15m", limit=55):
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) >= 20:
-                    closes = [float(candle[4]) for candle in data]
-                    _KLINE_CACHE[binance_symbol] = (now, closes)
-                    return closes
+                    highs = [float(c[2]) for c in data]
+                    lows = [float(c[3]) for c in data]
+                    closes = [float(c[4]) for c in data]
+                    result = {"high": highs, "low": lows, "close": closes}
+                    _KLINE_CACHE[binance_symbol] = (now, result)
+                    return result
         except Exception:
             continue
     return None
 
 
+def calculate_atr(highs, lows, closes, period=14):
+    """
+    Calculate 14-period Average True Range (ATR) in absolute price points.
+    """
+    if len(closes) < period + 1:
+        return closes[-1] * 0.01  # Fallback to 1% if insufficient data
+
+    tr_list = []
+    for i in range(1, len(closes)):
+        h = highs[i]
+        l = lows[i]
+        prev_c = closes[i - 1]
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        tr_list.append(tr)
+
+    # Wilder's smoothing for ATR
+    atr = np.mean(tr_list[:period])
+    for tr in tr_list[period:]:
+        atr = (atr * (period - 1) + tr) / period
+
+    return float(atr)
+
+
 def calculate_wilders_rsi(closes, period=14):
-    """Calculate standard Wilder's RSI from closing prices."""
     if len(closes) < period + 1:
         return 50.0
 
@@ -67,7 +91,6 @@ def calculate_wilders_rsi(closes, period=14):
 
 
 def calculate_ema(closes, period=20):
-    """True recursive Exponential Moving Average (EMA)."""
     if not closes:
         return 0.0
     if len(closes) < period:
@@ -80,33 +103,35 @@ def calculate_ema(closes, period=20):
     return float(ema)
 
 
-def evaluate_market(trend: str, rsi: float, momentum: float, liquidity_usd: float, macd: float, macd_signal: float, price: float, binance_symbol: str = None) -> str:
+def evaluate_market_with_atr(trend: str, price: float, binance_symbol: str = None) -> tuple:
     """
-    Evaluate market using 15m Klines (Wilder's RSI + EMA20/EMA50) with smart fallback.
+    Returns (signal, atr_value)
+    Evaluates 15m Klines + EMA + Wilder's RSI and returns computed ATR for dynamic SL/TP.
     """
-    if liquidity_usd < 20000.0:
-        return "HOLD"
+    default_atr = price * 0.01
 
     if binance_symbol:
-        closes = fetch_klines(binance_symbol, interval="15m", limit=55)
-        if closes and len(closes) >= 25:
-            # Update latest close with real-time WebSocket price
-            closes = closes[:-1] + [price]
+        k_data = fetch_full_klines(binance_symbol, interval="15m", limit=55)
+        if k_data and len(k_data["close"]) >= 25:
+            closes = k_data["close"][:-1] + [price]
+            highs = k_data["high"]
+            lows = k_data["low"]
+
             real_rsi = calculate_wilders_rsi(closes, period=14)
             ema20 = calculate_ema(closes, period=20)
             ema50 = calculate_ema(closes, period=50)
+            atr_val = calculate_atr(highs, lows, closes, period=14)
 
-            # Long Setup: Bullish EMA alignment or strong bounce above EMA20
+            # Cap ATR between 0.6% and 2.5% of price to ensure risk bounds
+            atr_val = max(price * 0.006, min(atr_val, price * 0.025))
+
             if (price >= ema20 or ema20 >= ema50) and 28.0 <= real_rsi <= 72.0 and trend == "UP":
-                return "LONG"
-            # Short Setup: Bearish EMA alignment or breakdown below EMA20
+                return "LONG", atr_val
             elif (price <= ema20 or ema20 <= ema50) and 28.0 <= real_rsi <= 72.0 and trend == "DOWN":
-                return "SHORT"
+                return "SHORT", atr_val
 
-    # Fallback momentum signal if Klines are warming up
-    if trend == "UP" and rsi < 70.0 and momentum >= 0.6:
-        return "LONG"
-    elif trend == "DOWN" and rsi > 30.0 and momentum <= 0.4:
-        return "SHORT"
+            return "HOLD", atr_val
 
-    return "HOLD"
+    # Fallback
+    fallback_signal = "LONG" if trend == "UP" else ("SHORT" if trend == "DOWN" else "HOLD")
+    return fallback_signal, default_atr
