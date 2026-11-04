@@ -91,6 +91,8 @@ class MultiTokenBot:
         self.ws_connected = False
         self.latest_prices = {}
         self.price_history = {s: [] for s in TOP_50_MAP}
+        self.btc_regime = {"regime": "STABLE", "allow_long": True, "allow_short": True, "reason": "System Initializing"}
+        self.last_crash_alert_time = 0
 
     async def handle_fast_tick(self, symbol: str, current_price: float):
         self.latest_prices[symbol] = current_price
@@ -189,6 +191,25 @@ class MultiTokenBot:
     async def klines_entry_scanner_loop(self):
         while self.is_running:
             try:
+                # 1. Update BTC Market Regime Filter (Crash Detector)
+                regime_data = await asyncio.to_thread(strategy_agent.check_btc_market_regime)
+                self.btc_regime = regime_data
+
+                # Send Alert if Crash Regime Triggered
+                now_ts = asyncio.get_event_loop().time()
+                if regime_data.get("regime") in ["CRASH", "BEAR"] and not regime_data.get("allow_long"):
+                    if (now_ts - self.last_crash_alert_time) > 600:  # Alert at most once per 10 mins
+                        self.last_crash_alert_time = now_ts
+                        await asyncio.to_thread(
+                            send_telegram_alert,
+                            f"🚨 *BTC CRASH DETECTOR TRIGGERED!*\n"
+                            f"• State: `{regime_data['regime']}` 📉\n"
+                            f"• Reason: `{regime_data['reason']}`\n"
+                            f"• Long Trading: `LOCKED ⛔`\n"
+                            f"• Short Trading: `ACTIVE ✅`"
+                        )
+
+                # 2. Sync batch prices
                 batch_prices = await asyncio.to_thread(fetch_vision_batch_prices)
                 for sym, price in batch_prices.items():
                     await self.handle_fast_tick(sym, price)
@@ -235,6 +256,10 @@ class MultiTokenBot:
                             bin_sym
                         )
 
+                        # Enforce BTC Regime Filter: Block LONG if BTC is crashing/bearish
+                        if signal == "LONG" and not self.btc_regime.get("allow_long", True):
+                            continue
+
                         if signal in ["LONG", "SHORT"]:
                             vol_bonus = min(30.0, (vol_ratio - 1.0) * 20.0)
                             score = round((cand["change_pct"] * 40.0) + 60.0 + vol_bonus, 1)
@@ -265,7 +290,6 @@ class MultiTokenBot:
                         if not self.engine.can_open_position(sym, side=sig):
                             continue
 
-                        # Dynamic Position Sizing based on score conviction
                         margin_amount = self.engine.calculate_position_size(score=score)
                         order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p, custom_atr=atr, score=score)
 
@@ -295,9 +319,10 @@ class MultiTokenBot:
                             alert_msg = (
                                 side_emoji + " *Dynamic Sized " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
-                                "• Conviction Tier: `" + conviction_badge + "`\n"
-                                "• Allocated Margin: `$" + f"{margin_amount:.2f}" + " ($" + f"{margin_amount * self.engine.leverage:.2f}" + " exp)`\n"
-                                "• Exposure Balance: `" + str(long_count) + "L / " + str(short_count) + "S (Cap: 3)` ⚖️\n"
+                                "• BTC Regime: `" + self.btc_regime.get("regime", "STABLE") + " 🛡️`\n"
+                                "• Conviction: `" + conviction_badge + "`\n"
+                                "• Margin: `$" + f"{margin_amount:.2f}" + "`\n"
+                                "• Exposure: `" + str(long_count) + "L / " + str(short_count) + "S (Cap: 3)` ⚖️\n"
                                 "• Macro Alignment: `" + m_trend + " + 15m " + sig + "` 🧭\n"
                                 "• Volume Spike: `" + f"{v_ratio:.2f}x" + " Avg Vol` 🔥\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
@@ -356,9 +381,11 @@ class MultiTokenBot:
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
+                            regime_icon = "🟢" if self.btc_regime.get("regime") == "STABLE" else "🚨"
                             status_reply = (
                                 "📊 *Chama Capital Management Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
+                                "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + " (" + self.btc_regime.get("reason", "") + ")`\n"
                                 "• Stream Feed: " + ws_str + "\n"
                                 "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
                                 "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
@@ -381,7 +408,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* Dynamic Sizing Engine active."
+                                "▶️ *Trading Resumed!* Dynamic Sizing & BTC Regime Guard active."
                             )
 
                         elif text == "/closeall":
@@ -404,11 +431,11 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Dynamic Position Sizing Upgrade Online!*\n"
-            "• Score >= 90: High Conviction (2.5% / $25 Margin)\n"
-            "• Score >= 75: Standard Conviction (2.0% / $20 Margin)\n"
-            "• Score < 75: Baseline (1.5% / $15 Margin)\n"
-            "• Directional Cap: Max 3 Long / 3 Short"
+            "🚀 *Upgrade 2 Complete: BTC Market Regime Filter Online!*\n"
+            "• Crash Guard: Detects rapid BTC dump (>= -1.2%) 📉\n"
+            "• Long Protection: Locks Altcoin LONGs during dump 🛡️\n"
+            "• Short Execution: Prioritizes high-momentum SHORTs\n"
+            "• Dynamic Sizing: Sized by Conviction Score"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
