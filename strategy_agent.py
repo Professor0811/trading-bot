@@ -2,19 +2,25 @@ import time
 import requests
 import numpy as np
 
-_KLINE_CACHE = {}
-CACHE_TTL = 60  # Cache 15m klines for 60 seconds per symbol
+# Separate caches for 15m (60s TTL) and 1h (300s TTL) klines
+_KLINE_CACHE_15M = {}
+_KLINE_CACHE_1H = {}
+CACHE_TTL_15M = 60
+CACHE_TTL_1H = 300
 
 
 def fetch_full_klines(binance_symbol: str, interval="15m", limit=55):
     """
-    Fetch full OHLCV klines (High, Low, Close, Volume) from Binance Vision API.
-    Returns dict with 'high', 'low', 'close', 'volume' lists or None.
+    Fetch full OHLCV klines (High, Low, Close, Volume) from Binance Vision API
+    with interval-aware smart caching.
     """
     now = time.time()
-    if binance_symbol in _KLINE_CACHE:
-        cached_time, cached_data = _KLINE_CACHE[binance_symbol]
-        if now - cached_time < CACHE_TTL:
+    cache = _KLINE_CACHE_1H if interval == "1h" else _KLINE_CACHE_15M
+    ttl = CACHE_TTL_1H if interval == "1h" else CACHE_TTL_15M
+
+    if binance_symbol in cache:
+        cached_time, cached_data = cache[binance_symbol]
+        if now - cached_time < ttl:
             return cached_data
 
     urls = [
@@ -37,7 +43,7 @@ def fetch_full_klines(binance_symbol: str, interval="15m", limit=55):
                         "close": closes,
                         "volume": volumes
                     }
-                    _KLINE_CACHE[binance_symbol] = (now, result)
+                    cache[binance_symbol] = (now, result)
                     return result
         except Exception:
             continue
@@ -123,10 +129,33 @@ def calculate_ema(closes, period=20):
     return float(ema)
 
 
+def get_1h_macro_trend(binance_symbol: str, current_price: float) -> str:
+    """
+    Determine 1-Hour (1H) Macro Trend using 1H EMA 20 and EMA 50.
+    Returns 'BULL', 'BEAR', or 'NEUTRAL'.
+    """
+    k_1h = fetch_full_klines(binance_symbol, interval="1h", limit=55)
+    if not k_1h or len(k_1h["close"]) < 25:
+        return "NEUTRAL"
+
+    closes_1h = k_1h["close"][:-1] + [current_price]
+    ema20_1h = calculate_ema(closes_1h, period=20)
+    ema50_1h = calculate_ema(closes_1h, period=50)
+
+    if current_price >= ema50_1h and ema20_1h >= ema50_1h * 0.998:
+        return "BULL"
+    elif current_price <= ema50_1h and ema20_1h <= ema50_1h * 1.002:
+        return "BEAR"
+    elif current_price >= ema20_1h:
+        return "BULL"
+    else:
+        return "BEAR"
+
+
 def evaluate_market_with_atr(trend: str, price: float, binance_symbol: str = None) -> tuple:
     """
-    Returns (signal, atr_value, volume_ratio)
-    Filters out low-volume fakeouts by requiring Volume Ratio >= 1.10x of 20-period SMA.
+    Returns (signal, atr_value, volume_ratio, macro_1h_trend)
+    Combines 15m Klines (RSI + EMA + Volume Spike) with 1H Macro Trend alignment.
     """
     default_atr = price * 0.01
 
@@ -146,14 +175,22 @@ def evaluate_market_with_atr(trend: str, price: float, binance_symbol: str = Non
 
             atr_val = max(price * 0.006, min(atr_val, price * 0.025))
 
+            # 1. Fakeout Protection: Require Volume Ratio >= 1.10x
             if vol_ratio < 1.10:
-                return "HOLD", atr_val, vol_ratio
+                return "HOLD", atr_val, vol_ratio, "NEUTRAL"
 
-            if (price >= ema20 or ema20 >= ema50) and 28.0 <= real_rsi <= 72.0 and trend == "UP":
-                return "LONG", atr_val, vol_ratio
-            elif (price <= ema20 or ema20 <= ema50) and 28.0 <= real_rsi <= 72.0 and trend == "DOWN":
-                return "SHORT", atr_val, vol_ratio
+            # 2. Check 1H Macro Trend Alignment
+            macro_trend = get_1h_macro_trend(binance_symbol, price)
 
-            return "HOLD", atr_val, vol_ratio
+            # 3. 15m + 1H Aligned Entry Signals
+            is_15m_long = (price >= ema20 or ema20 >= ema50) and 28.0 <= real_rsi <= 72.0 and trend == "UP"
+            is_15m_short = (price <= ema20 or ema20 <= ema50) and 28.0 <= real_rsi <= 72.0 and trend == "DOWN"
 
-    return "HOLD", default_atr, 1.0
+            if is_15m_long and macro_trend in ["BULL", "NEUTRAL"]:
+                return "LONG", atr_val, vol_ratio, f"1H {macro_trend}"
+            elif is_15m_short and macro_trend in ["BEAR", "NEUTRAL"]:
+                return "SHORT", atr_val, vol_ratio, f"1H {macro_trend}"
+
+            return "HOLD", atr_val, vol_ratio, f"1H {macro_trend}"
+
+    return "HOLD", default_atr, 1.0, "NEUTRAL"
