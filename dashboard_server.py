@@ -1,6 +1,7 @@
 import os
 import asyncio
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,9 +75,10 @@ async def get_metrics():
         long_count = 0
         short_count = 0
 
-        # Dynamic per-token allocation breakdown for Donut Chart
         donut_labels = []
         donut_values = []
+
+        now_sec = time.time()
 
         for sym, p in bot_instance.engine.positions.items():
             cur_p = bot_instance.latest_prices.get(sym, p["entry_price"])
@@ -87,6 +89,11 @@ async def get_metrics():
             sl = p["sl_price"]
             liq = p["liq_price"]
             partial_tp = p.get("partial_tp_price", tp)
+            opened_at = p.get("opened_at", now_sec)
+
+            # Calculate Holding Age
+            elapsed_m = int((now_sec - opened_at) / 60)
+            age_str = f"{elapsed_m // 60}h {elapsed_m % 60}m" if elapsed_m >= 60 else f"{elapsed_m}m"
 
             if side == "LONG":
                 long_count += 1
@@ -116,13 +123,13 @@ async def get_metrics():
                 "tp_price": tp,
                 "liq_price": liq,
                 "partial_tp": partial_tp,
-                "progress_pct": round(progress_pct, 1)
+                "progress_pct": round(progress_pct, 1),
+                "age_str": age_str
             })
 
             donut_labels.append(sym)
             donut_values.append(round(p["margin"], 2))
 
-        # Add reserve cash slice
         donut_labels.append("Reserve Cash")
         donut_values.append(round(available_cash, 2))
 
@@ -178,6 +185,7 @@ async def get_metrics():
             "leverage": getattr(config, "LEVERAGE", 10),
             "max_concurrent": getattr(config, "MAX_CONCURRENT_TRADES", 5),
             "trading_enabled": bot_instance.trading_enabled,
+            "btc_regime": bot_instance.btc_regime,
             "long_count": long_count,
             "short_count": short_count,
             "positions": positions_list,
@@ -263,6 +271,10 @@ CHAMA_DASHBOARD_HTML = """
         .status-pill { background: rgba(16, 185, 129, 0.12); color: var(--accent-green); border: 1px solid rgba(16, 185, 129, 0.3); padding: 6px 14px; border-radius: 999px; font-size: 11px; font-weight: 700; }
         .status-pill.paused { background: rgba(239, 68, 68, 0.12); color: var(--accent-red); border-color: rgba(239, 68, 68, 0.3); }
 
+        .regime-pill { background: rgba(56, 189, 248, 0.12); color: var(--accent-cyan); border: 1px solid rgba(56, 189, 248, 0.3); padding: 6px 14px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+        .regime-pill.crash { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); border-color: rgba(239, 68, 68, 0.5); animation: pulse 1s infinite alternate; }
+        @keyframes pulse { from { opacity: 0.7; } to { opacity: 1; } }
+
         .btn-group { display: flex; gap: 8px; }
         .btn { background: #1e293b; color: #fff; border: 1px solid #334155; padding: 6px 14px; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; }
         .btn:hover { background: #334155; }
@@ -313,7 +325,6 @@ CHAMA_DASHBOARD_HTML = """
         .pnl-pos { color: var(--accent-green); font-weight: 700; }
         .pnl-neg { color: var(--accent-red); font-weight: 700; }
 
-        /* TradingView Modal */
         #chart-modal { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(3,7,18,0.85); backdrop-filter: blur(6px); z-index: 2000; align-items: center; justify-content: center; }
         .modal-card { background: #0f172a; border: 1px solid #334155; border-radius: 12px; width: 92%; max-width: 900px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.7); }
         .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
@@ -329,7 +340,6 @@ CHAMA_DASHBOARD_HTML = """
 <body>
     <div id="toast">Command executed successfully</div>
 
-    <!-- Official TradingView Real-Time Chart Modal -->
     <div id="chart-modal">
         <div class="modal-card">
             <div class="modal-header">
@@ -360,6 +370,7 @@ CHAMA_DASHBOARD_HTML = """
             <span class="nav-link">Reports (FY2026)</span>
         </div>
         <div class="market-status">
+            <div class="regime-pill" id="btc-regime-pill">🛡️ BTC: STABLE</div>
             <div class="btn-group">
                 <button class="btn" onclick="controlBot('pause')">Pause</button>
                 <button class="btn btn-orange" onclick="controlBot('resume')">Resume</button>
@@ -398,7 +409,7 @@ CHAMA_DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Secondary Metrics Grid -->
+    <!-- Secondary Metrics Grid with Zombie Protocol -->
     <div class="metrics-grid">
         <div class="metric-card">
             <div class="metric-title">Available Cash</div>
@@ -409,19 +420,18 @@ CHAMA_DASHBOARD_HTML = """
             <div class="metric-val" id="active-slots">0 / 5</div>
         </div>
         <div class="metric-card">
-            <div class="metric-title">Sound Alerts</div>
-            <div class="metric-val" style="color:var(--accent-cyan); font-size: 16px; margin-top: 4px;">🔊 Web Audio Active</div>
+            <div class="metric-title">Zombie Exit</div>
+            <div class="metric-val" style="color:var(--accent-cyan); font-size: 15px; margin-top: 4px;">🧟 3h Limit Active</div>
         </div>
         <div class="metric-card">
             <div class="metric-title">Risk Model</div>
-            <div class="metric-val" style="color:var(--accent-green); font-size: 16px; margin-top: 4px;">Dynamic ATR (1.5x / 3x)</div>
+            <div class="metric-val" style="color:var(--accent-green); font-size: 15px; margin-top: 4px;">Dynamic ATR (1.5x / 3x)</div>
         </div>
     </div>
 
     <!-- Main Grid Layout -->
     <div class="main-grid">
         <div>
-            <!-- Active Positions Panel -->
             <div class="panel">
                 <div class="panel-header">
                     <span>Active Portfolio Holdings (Click card for Real TradingView Chart)</span>
@@ -432,7 +442,6 @@ CHAMA_DASHBOARD_HTML = """
                 </div>
             </div>
 
-            <!-- Cumulative Performance + Holdings Weight Donut -->
             <div class="panel">
                 <div class="panel-header"><span>Cumulative Equity & Holdings Allocation (AUM Weight)</span></div>
                 <div class="centerpiece-grid">
@@ -449,7 +458,6 @@ CHAMA_DASHBOARD_HTML = """
         </div>
 
         <div>
-            <!-- Top 10 Market Scanner Radar Panel -->
             <div class="panel">
                 <div class="panel-header"><span>Market Scanner Radar (Top 10)</span></div>
                 <div class="radar-box" id="radar-container">
@@ -459,7 +467,6 @@ CHAMA_DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- Recent Trade Activity Table -->
     <div class="panel">
         <div class="panel-header"><span>Recent Trade Activity & Scale-Out Matrix</span></div>
         <table>
@@ -479,7 +486,6 @@ CHAMA_DASHBOARD_HTML = """
     </div>
 
     <script>
-        // Web Audio Synthesizer
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         function playChime(freq, type, duration) {
             try {
@@ -501,12 +507,10 @@ CHAMA_DASHBOARD_HTML = """
 
         let prevTradeCount = null;
 
-        // Cumulative Equity Line Chart
         const ctx = document.getElementById('equityChart').getContext('2d');
         const equityData = { labels: [], datasets: [{ label: 'Equity ($)', data: [], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.08)', borderWidth: 2, fill: true, tension: 0.3 }] };
-        const equityChart = new Chart(ctx, { type: 'line', data: equityData, options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e2937' } }, y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e2937' } } } } });
+        const equityChart = new Chart(ctx, { type: 'line', data: equityData, options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e293b' } } } } });
 
-        // Institutional Holdings Weight Donut Chart
         const palette = ['#06b6d4', '#10b981', '#f59e0b', '#818cf8', '#ec4899', '#8b5cf6', '#14b8a6', '#64748b'];
         const donutCtx = document.getElementById('donutChart').getContext('2d');
         const donutChart = new Chart(donutCtx, {
@@ -529,10 +533,8 @@ CHAMA_DASHBOARD_HTML = """
             }
         });
 
-        // Official TradingView Real-Time Embed Widget
         function openChartModal(symbol) {
             const rawCoin = symbol.split('/')[0].toUpperCase();
-            // Handle POL/MATIC or standard binance perpetual pair
             const binanceSymbol = rawCoin === 'MATIC' ? 'BINANCE:POLUSDT.P' : ('BINANCE:' + rawCoin + 'USDT.P');
 
             document.getElementById('modal-token-name').textContent = symbol;
@@ -601,6 +603,18 @@ CHAMA_DASHBOARD_HTML = """
                     document.getElementById('exposure-balance').textContent = m.long_count + 'L / ' + m.short_count + 'S';
                     document.getElementById('active-slots').textContent = m.active_positions_count + ' / ' + m.max_concurrent;
 
+                    const rPill = document.getElementById('btc-regime-pill');
+                    if (m.btc_regime) {
+                        const reg = m.btc_regime.regime || 'STABLE';
+                        if (reg === 'STABLE') {
+                            rPill.textContent = '🛡️ BTC: STABLE';
+                            rPill.className = 'regime-pill';
+                        } else {
+                            rPill.textContent = '🚨 BTC: ' + reg + ' (LONG LOCKED)';
+                            rPill.className = 'regime-pill crash';
+                        }
+                    }
+
                     const pill = document.getElementById('bot-status-pill');
                     if (m.trading_enabled) {
                         pill.textContent = '● MARKET OPEN // 10X PRO';
@@ -610,7 +624,6 @@ CHAMA_DASHBOARD_HTML = """
                         pill.className = 'status-pill paused';
                     }
 
-                    // Update Holdings Allocation Donut Chart
                     if (m.donut_labels && m.donut_values) {
                         donutChart.data.labels = m.donut_labels;
                         donutChart.data.datasets[0].data = m.donut_values;
@@ -621,7 +634,6 @@ CHAMA_DASHBOARD_HTML = """
                         donutChart.update();
                     }
 
-                    // Render Active Positions Cards
                     const posContainer = document.getElementById('active-positions-container');
                     if (m.positions && m.positions.length > 0) {
                         posContainer.innerHTML = '';
@@ -638,6 +650,7 @@ CHAMA_DASHBOARD_HTML = """
                                 </div>
                                 <div class="pos-info"><span>Entry Price:</span><span class="pos-num">$${p.entry_price.toFixed(5)}</span></div>
                                 <div class="pos-info"><span>Live WSS Price:</span><span class="pos-num" style="color:var(--accent-cyan);">$${p.current_price.toFixed(5)}</span></div>
+                                <div class="pos-info"><span>Age / Time:</span><span class="pos-num" style="color:#f59e0b;">⏳ ${p.age_str}</span></div>
                                 <div class="pos-info"><span>Stop-Loss / Liq:</span><span class="pos-num" style="color:var(--accent-red);">$${p.sl_price.toFixed(5)}</span></div>
                                 <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${p.progress_pct}%;"></div></div>
                             `;
@@ -647,7 +660,6 @@ CHAMA_DASHBOARD_HTML = """
                         posContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 13px; font-style: italic;">No active positions open right now...</div>';
                     }
 
-                    // Render Top 10 Coins in Market Scanner Radar
                     const radarContainer = document.getElementById('radar-container');
                     if (m.radar && m.radar.length > 0) {
                         radarContainer.innerHTML = '';
@@ -665,7 +677,6 @@ CHAMA_DASHBOARD_HTML = """
                         });
                     }
 
-                    // Update Cumulative Equity Line Chart
                     const nowStr = new Date().toLocaleTimeString();
                     if (equityData.labels.length > 30) { equityData.labels.shift(); equityData.datasets[0].data.shift(); }
                     equityData.labels.push(nowStr);
