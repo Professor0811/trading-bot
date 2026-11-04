@@ -2,7 +2,7 @@ import os
 import asyncio
 import sqlite3
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, POST, Body
+from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import config
@@ -87,7 +87,6 @@ async def get_metrics():
                 long_count += 1
                 unrealized_pnl = (cur_p - entry) / entry * leveraged_size
                 roe_pct = ((cur_p - entry) / entry) * bot_instance.engine.leverage * 100.0
-                # Calculate progress percentage towards full TP
                 total_dist = max(0.0001, tp - entry)
                 current_dist = max(0.0, cur_p - entry)
                 progress_pct = min(100.0, (current_dist / total_dist) * 100.0)
@@ -114,7 +113,6 @@ async def get_metrics():
                 "progress_pct": round(progress_pct, 1)
             })
 
-        # Calculate Win Rate from database closed trades
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades WHERE status = 'CLOSED'")
@@ -125,7 +123,6 @@ async def get_metrics():
         winning_trades = row[1] if row and row[1] else 0
         win_rate = round((winning_trades / total_closed * 100.0), 1) if total_closed > 0 else 0.0
 
-        # Gather top 5 market scanner radar items from latest prices & history
         radar_list = []
         for sym, hist in bot_instance.price_history.items():
             if len(hist) >= 2:
@@ -247,12 +244,10 @@ ULTIMATE_TERMINAL_HTML = """
         .pos-row { display: flex; justify-content: space-between; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
         .pos-val { color: #f1f5f9; font-weight: 600; }
 
-        /* Progress Bar */
         .progress-container { background: #1e293b; border-radius: 999px; height: 8px; width: 100%; margin-top: 12px; overflow: hidden; position: relative; }
         .progress-bar { background: linear-gradient(90deg, #06b6d4, #10b981); height: 100%; border-radius: 999px; transition: width 0.4s ease; }
         .progress-labels { display: flex; justify-content: space-between; font-size: 10px; color: #64748b; margin-top: 4px; }
 
-        /* Radar table */
         .radar-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #0f172a; border-radius: 8px; margin-bottom: 8px; font-size: 13px; border: 1px solid #1e293b; }
         
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -388,7 +383,6 @@ ULTIMATE_TERMINAL_HTML = """
                         badge.className = 'badge badge-paused';
                     }
 
-                    // Render Active Positions Cards with TP Progress Bars
                     const posContainer = document.getElementById('active-positions-container');
                     if (m.positions && m.positions.length > 0) {
                         posContainer.innerHTML = '';
@@ -418,7 +412,6 @@ ULTIMATE_TERMINAL_HTML = """
                         posContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 13px; font-style: italic;">No active positions open right now...</div>';
                     }
 
-                    // Render Market Scanner Radar
                     const radarContainer = document.getElementById('radar-container');
                     if (m.radar && m.radar.length > 0) {
                         radarContainer.innerHTML = '';
@@ -435,7 +428,6 @@ ULTIMATE_TERMINAL_HTML = """
                         });
                     }
 
-                    // Update Chart
                     const nowStr = new Date().toLocaleTimeString();
                     if (equityData.labels.length > 30) { equityData.labels.shift(); equityData.datasets[0].data.shift(); }
                     equityData.labels.push(nowStr);
