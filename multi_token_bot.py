@@ -50,7 +50,6 @@ def fmt_p(val: float) -> str:
 
 
 def fetch_vision_batch_prices() -> dict:
-    """Unblocked Binance Vision batch fetch to seed and back up the WebSocket stream."""
     prices = {}
     try:
         res = requests.get("https://data-api.binance.vision/api/v3/ticker/price", timeout=4)
@@ -93,10 +92,6 @@ class MultiTokenBot:
         self.price_history = {s: [] for s in TOP_50_MAP}
 
     async def handle_fast_tick(self, symbol: str, current_price: float):
-        """
-        Pure in-memory millisecond tick handler.
-        Never makes blocking HTTP calls—only updates prices and triggers instant TP/SL exits.
-        """
         self.latest_prices[symbol] = current_price
         history = self.price_history[symbol]
         if not history or history[-1] != current_price:
@@ -104,7 +99,7 @@ class MultiTokenBot:
             if len(history) > 30:
                 history.pop(0)
 
-        # Instantaneous TP / SL / Trailing Stop / Liquidation check
+        # Millisecond Exit Evaluation (Instant TP / Dynamic ATR SL)
         if symbol in self.engine.positions:
             closed = self.engine.check_exit_conditions_for_token(symbol, current_price)
             if closed:
@@ -121,7 +116,7 @@ class MultiTokenBot:
                 )
 
                 alert_msg = (
-                    "🏁 *Real-Time WebSocket Exit (Slot Freed!)*\n"
+                    "🏁 *Real-Time Exit (Slot Freed!)*\n"
                     "• Pair: `" + symbol + "` (" + side_name + " " + str(self.engine.leverage) + "x)\n"
                     "• Reason: `" + str(closed['reason']) + "`\n"
                     "• Entry Price: `$" + fmt_p(closed['entry_price']) + "`\n"
@@ -133,27 +128,20 @@ class MultiTokenBot:
                 await asyncio.to_thread(send_telegram_alert, alert_msg)
 
     async def websocket_stream_listener(self):
-        """
-        Connects to US-unblocked Binance Vision WebSocket (`wss://data-stream.binance.vision`)
-        with automatic failover.
-        """
         endpoints = [
             "wss://data-stream.binance.vision/ws/!miniTicker@arr",
-            "wss://stream.binance.com:9443/ws/!miniTicker@arr",
-            "wss://fstream.binance.com/ws/!miniTicker@arr"
+            "wss://stream.binance.com:9443/ws/!miniTicker@arr"
         ]
         idx = 0
 
         while self.is_running:
             uri = endpoints[idx % len(endpoints)]
             try:
-                print("[WebSocket] Connecting to:", uri)
                 async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
                     self.ws_connected = True
-                    print("[WebSocket] Live stream active on:", uri)
                     await asyncio.to_thread(
                         send_telegram_alert,
-                        "🔌 *WebSocket Stream Connected!*\n• Endpoint: `" + uri.split("/ws/")[0] + "`\n• Feed: Real-Time 50-Coin MiniTickers"
+                        "🔌 *WebSocket Stream Connected!*\n• Feed: Real-Time Binance Vision WSS"
                     )
 
                     async for message in ws:
@@ -166,27 +154,18 @@ class MultiTokenBot:
                                 price_str = item.get("c")
                                 if b_sym in REVERSE_MAP and price_str:
                                     await self.handle_fast_tick(REVERSE_MAP[b_sym], float(price_str))
-            except Exception as e:
+            except Exception:
                 self.ws_connected = False
-                print("[WebSocket Reconnecting]:", e)
                 idx += 1
                 await asyncio.sleep(3)
 
     async def klines_entry_scanner_loop(self):
-        """
-        Dedicated non-blocking scanner loop that ranks all 50 coins and evaluates
-        15m Klines (Wilder's RSI + EMA) in background threads to fill all 5 slots.
-        """
-        print("[Klines Entry Scanner] Active and warming up...")
-
         while self.is_running:
             try:
-                # Seed/refresh prices from Vision API so all 50 coins are immediately available
                 batch_prices = await asyncio.to_thread(fetch_vision_batch_prices)
                 for sym, price in batch_prices.items():
                     await self.handle_fast_tick(sym, price)
 
-                # Check 10% Daily Drawdown Circuit Breaker
                 if self.engine.is_circuit_breaker_triggered():
                     if not self.circuit_breaker_alerted:
                         self.trading_enabled = False
@@ -198,7 +177,6 @@ class MultiTokenBot:
 
                 free_slots = self.engine.max_concurrent - len(self.engine.positions)
                 if self.trading_enabled and free_slots > 0 and len(self.latest_prices) > 0:
-                    # 1. Pre-rank coins by live price action so we evaluate the strongest movers first
                     pre_candidates = []
                     for symbol, current_price in list(self.latest_prices.items()):
                         if not self.engine.can_open_position(symbol):
@@ -209,31 +187,24 @@ class MultiTokenBot:
 
                         price_change_pct = abs((history[-1] - history[0]) / (history[0] + 1e-9)) * 100.0
                         trend = "UP" if history[-1] >= history[0] else "DOWN"
-                        momentum = 0.85 if trend == "UP" else 0.35
                         pre_candidates.append({
                             "symbol": symbol,
                             "price": current_price,
                             "trend": trend,
-                            "momentum": momentum,
                             "change_pct": price_change_pct
                         })
 
                     pre_candidates.sort(key=lambda x: x["change_pct"], reverse=True)
 
-                    # 2. Evaluate top 15 movers using Real 15m Klines in a non-blocking thread
+                    # Evaluate top movers using 15m Klines + Dynamic ATR
                     verified_picks = []
                     for cand in pre_candidates[:15]:
                         sym = cand["symbol"]
                         bin_sym = TOP_50_MAP.get(sym, "BTCUSDT")
 
-                        signal = await asyncio.to_thread(
-                            strategy_agent.evaluate_market,
+                        signal, atr_val = await asyncio.to_thread(
+                            strategy_agent.evaluate_market_with_atr,
                             cand["trend"],
-                            50.0,
-                            cand["momentum"],
-                            1000000.0,
-                            1.2,
-                            0.6,
                             cand["price"],
                             bin_sym
                         )
@@ -244,20 +215,22 @@ class MultiTokenBot:
                                 "symbol": sym,
                                 "signal": signal,
                                 "price": cand["price"],
-                                "score": score
+                                "score": score,
+                                "atr": atr_val
                             })
                             if len(verified_picks) >= free_slots:
                                 break
 
-                    # 3. Execute top verified setups up to free_slots
+                    # Open position with Dynamic ATR
                     for pick in verified_picks[:free_slots]:
                         sym = pick["symbol"]
                         sig = pick["signal"]
                         cur_p = pick["price"]
                         score = pick["score"]
+                        atr = pick["atr"]
 
                         margin_amount = self.engine.calculate_position_size()
-                        order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p)
+                        order_success = self.engine.execute_order(sym, sig, margin_amount, cur_p, custom_atr=atr)
 
                         if order_success:
                             pos = self.engine.positions.get(sym, {})
@@ -280,13 +253,12 @@ class MultiTokenBot:
 
                             side_emoji = "🟢" if sig == "LONG" else "🔴"
                             alert_msg = (
-                                side_emoji + " *WebSocket + Klines " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
+                                side_emoji + " *Dynamic ATR " + str(self.engine.leverage) + "x Order (" + sig + ")*\n"
                                 "• Pair: `" + sym + "` (Score: `" + str(score) + "`)\n"
                                 "• Leverage: `" + str(self.engine.leverage) + "x Isolated`\n"
                                 "• Entry Price: `$" + fmt_p(entry_p) + "`\n"
-                                "• Margin (2%): `$" + f"{margin_amount:.2f}" + "` (Exposure: `$" + f"{leveraged_size:.2f}" + "`)\n"
-                                "• Take-Profit Target: `$" + fmt_p(tp_p) + "`\n"
-                                "• Stop-Loss Target: `$" + fmt_p(sl_p) + "`\n"
+                                "• Dynamic SL (1.5x ATR): `$" + fmt_p(sl_p) + "`\n"
+                                "• Dynamic TP (3.0x ATR): `$" + fmt_p(tp_p) + "`\n"
                                 "• Est. Liq Price: `$" + fmt_p(liq_p) + "`\n"
                                 "• Active Slots: `" + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "`\n"
                                 "• Wallet Balance: `$" + f"{self.engine.cash_balance:.2f}" + "`"
@@ -294,7 +266,7 @@ class MultiTokenBot:
                             await asyncio.to_thread(send_telegram_alert, alert_msg)
 
             except Exception as e:
-                print("[Klines Entry Scanner Error]:", e)
+                print("[Klines Scanner Error]:", e)
 
             await asyncio.sleep(5)
 
@@ -325,19 +297,20 @@ class MultiTokenBot:
                             for sym, p in self.engine.positions.items():
                                 entry_str = fmt_p(p["entry_price"])
                                 tp_str = fmt_p(p["tp_price"])
+                                sl_str = fmt_p(p["sl_price"])
                                 side_str = p["side"]
                                 margin_str = f"{p['margin']:.2f}"
-                                line = "• " + sym + " (" + side_str + " " + str(self.engine.leverage) + "x): Margin $" + margin_str + " | Entry $" + entry_str + " | TP $" + tp_str
+                                line = "• " + sym + " (" + side_str + " " + str(self.engine.leverage) + "x): Margin $" + margin_str + " | Entry $" + entry_str + " | SL $" + sl_str + " | TP $" + tp_str
                                 active_desc.append(line)
                             pos_text = "\n".join(active_desc) if active_desc else "None (0/5 Active Slots)"
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             ws_str = "ONLINE (WSS)" if self.ws_connected else "SYNCING (Vision)"
                             status_reply = (
-                                "📊 *WebSocket + Klines Bot Status:*\n"
+                                "📊 *Professional Dynamic ATR Bot Status:*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Stream Feed: " + ws_str + "\n"
-                                "• Live Coins Synced: " + str(len(self.latest_prices)) + "/50\n"
+                                "• Live Tracked Coins: " + str(len(self.latest_prices)) + "/50\n"
                                 "• Available Cash: $" + f"{self.engine.cash_balance:.2f}" + "\n"
                                 "• Realized PnL: $" + f"{self.engine.realized_pnl:+.2f}" + "\n"
                                 "• Active Slots: " + str(len(self.engine.positions)) + "/" + str(self.engine.max_concurrent) + "\n"
@@ -349,7 +322,7 @@ class MultiTokenBot:
                             self.trading_enabled = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "🛑 *Trading Paused!* WebSocket exits remain active, no new entries."
+                                "🛑 *Trading Paused!* Exits remain active, no new entries."
                             )
 
                         elif text == "/start":
@@ -357,7 +330,7 @@ class MultiTokenBot:
                             self.circuit_breaker_alerted = False
                             await asyncio.to_thread(
                                 send_telegram_alert,
-                                "▶️ *Trading Resumed!* WebSocket + Klines scanner active."
+                                "▶️ *Trading Resumed!* Dynamic ATR Engine active."
                             )
 
                         elif text == "/closeall":
@@ -381,10 +354,11 @@ class MultiTokenBot:
     async def run_parallel_trading(self):
         await asyncio.to_thread(
             send_telegram_alert,
-            "🚀 *Dual-Engine WebSocket + Klines Bot Online!*\n"
-            "• Tick Stream: Binance Vision Real-Time WSS\n"
-            "• Strategy Core: Non-Blocking 15m Klines (RSI + EMA)\n"
-            "• Max Concurrent Slots: " + str(self.engine.max_concurrent)
+            "🚀 *Institutional-Grade Dynamic ATR Futures Bot Online!*\n"
+            "• Stream: Millisecond Binance Vision WSS\n"
+            "• Strategy: 15m Klines + Wilder's RSI + EMA 20/50\n"
+            "• Risk: Dynamic ATR SL (1.5x) & TP (3.0x)\n"
+            "• Capacity: 5 Slots (10x Isolated Margin)"
         )
         await asyncio.gather(
             self.websocket_stream_listener(),
