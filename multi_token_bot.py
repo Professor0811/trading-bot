@@ -5,6 +5,7 @@ from datetime import datetime
 import config
 import strategy_agent
 import database
+import bot_bridge
 from bybit_connector import bybit_client
 from paper_engine import PaperTradingEngine
 from telegram_alerts import send_telegram_alert
@@ -112,11 +113,11 @@ class MultiTokenBot:
     async def bybit_scanner_and_trading_loop(self):
         while self.is_running:
             try:
-                # 1. Bitcoin Market Regime පරීක්ෂාව
+                # 1. Bitcoin Market Regime Check
                 regime_data = await asyncio.to_thread(strategy_agent.check_btc_market_regime)
                 self.btc_regime = regime_data
 
-                # 2. කාසි 300+ සඳහා Tickers ලබා ගැනීම
+                # 2. Fetch all Linear Tickers
                 all_tickers = await asyncio.to_thread(bybit_client.fetch_all_linear_tickers)
                 valid_candidates = []
                 radar_items = []
@@ -157,7 +158,7 @@ class MultiTokenBot:
                     radar_items.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
                     self.market_radar = radar_items[:15]
 
-                # Circuit Breaker පරීක්ෂාව
+                # Circuit Breaker Check
                 if self.engine.is_circuit_breaker_triggered():
                     if not self.circuit_breaker_alerted:
                         self.trading_enabled = False
@@ -167,7 +168,7 @@ class MultiTokenBot:
                             "🚨 *CIRCUIT BREAKER TRIGGERED!* Net loss reached 10%. Trading halted!"
                         )
 
-                # 3. Stage 2: ප්‍රශස්ත Momentum කාසි සඳහා ගැඹුරු විශ්ලේෂණය
+                # 3. Stage 2: Deep Scan for Entry Signals
                 free_slots = self.engine.max_concurrent - len(self.engine.positions)
                 if self.trading_enabled and free_slots > 0 and valid_candidates:
                     valid_candidates.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
@@ -217,6 +218,12 @@ class MultiTokenBot:
                         m_trend = pick["macro_trend"]
 
                         if not self.engine.can_open_position(sym, side=sig):
+                            continue
+
+                        # --- Fundamental Research Bot Guard (Cloud Supabase Bridge) ---
+                        should_block, block_reason = bot_bridge.should_block_trade(sig)
+                        if should_block:
+                            print(f"[Fundamental Guard]: Blocked {sig} on {sym} -> {block_reason}")
                             continue
 
                         margin_amount = self.engine.calculate_position_size(score=score)
@@ -310,11 +317,17 @@ class MultiTokenBot:
 
                             state_str = "ACTIVE" if self.trading_enabled else "PAUSED"
                             regime_icon = "🟢" if self.btc_regime.get("regime") == "STABLE" else "🚨"
+
+                            # Read live macro bias from bridge
+                            macro_info = bot_bridge.get_current_market_bias()
+                            freeze_tag = " ⛔ (NEWS FREEZE)" if macro_info.get("is_news_freeze") else " ✅"
+
                             status_reply = (
                                 "📊 *Chama Capital Management - Status:*\n"
                                 "• Engine State: " + state_str + "\n"
                                 "• Exchange Feed: `Bybit Hybrid (300+ Pairs)` ⚡\n"
                                 "• Database: `" + ("Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite") + "` 🗄️\n"
+                                "• Fundamental Bias: `" + str(macro_info.get("bias_label")) + " (" + f"{macro_info.get('composite_score', 0):+.1f}" + ")`" + freeze_tag + "\n"
                                 "• BTC Regime: " + regime_icon + " `" + self.btc_regime.get("regime", "STABLE") + "`\n"
                                 "• Directional Exposure: `" + str(long_c) + " LONG / " + str(short_c) + " SHORT (Max 3/side)` ⚖️\n"
                                 "• Tracked Pairs: " + str(len(self.latest_prices)) + " Live Pairs\n"
@@ -352,8 +365,9 @@ class MultiTokenBot:
         db_type = "Cloud PostgreSQL (Supabase)" if database.is_postgres else "Local SQLite"
         await asyncio.to_thread(
             send_telegram_alert,
-            f"🚀 *Bybit V5 Quant Engine Online (Hybrid Failover Activated)!* ⚡\n"
+            f"🚀 *Bybit V5 Quant Engine Online (Fundamental Guard Synced)!* ⚡\n"
             f"• Market Feed: `Zero-Drop Multi-Stream Feed` 🌐\n"
+            f"• Fundamental Research Bridge: `Cloud PostgreSQL (Supabase)` 🧠\n"
             f"• Scanner: `300+ Pairs 2-Stage Filter ($1M+ Vol)`\n"
             f"• Persistence: `{db_type}` 🗄️\n"
             f"• BTC Crash Guard & Zombie Killer: Fully Armed 🛡️🧟"
